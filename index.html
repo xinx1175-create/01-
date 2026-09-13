@@ -1,0 +1,813 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>策略竞技场</title>
+<style>
+  :root{
+    --bg:#0b0d10;
+    --panel:#101318;
+    --line:#1e242d;
+    --line2:#2a323d;
+    --fg:#d6dbe3;
+    --dim:#79838f;
+    --dim2:#525b66;
+    --up:#3ecf8e;
+    --dn:#f0616d;
+    --mono:ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;padding:0}
+  body{
+    background:var(--bg);
+    color:var(--fg);
+    font-family:var(--mono);
+    font-size:13px;
+    line-height:1.45;
+    -webkit-text-size-adjust:100%;
+    padding:0 14px calc(28px + env(safe-area-inset-bottom));
+    max-width:760px;
+    margin:0 auto;
+  }
+  header{
+    padding:18px 0 12px;
+    border-bottom:1px solid var(--line);
+    display:flex;
+    align-items:baseline;
+    justify-content:space-between;
+    gap:12px;
+    flex-wrap:wrap;
+  }
+  h1{
+    font-size:15px;
+    font-weight:600;
+    letter-spacing:.06em;
+    margin:0;
+  }
+  .sub{color:var(--dim2);font-size:11px}
+
+  section{padding:14px 0;border-bottom:1px solid var(--line)}
+
+  .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px}
+  label{display:block}
+  .lbl{color:var(--dim);font-size:11px;margin-bottom:4px}
+  input,select{
+    width:100%;
+    background:var(--panel);
+    border:1px solid var(--line2);
+    color:var(--fg);
+    font-family:var(--mono);
+    font-size:13px;
+    padding:7px 8px;
+    border-radius:4px;
+  }
+  input:focus,select:focus{outline:none;border-color:#3d4856}
+  input:disabled,select:disabled{color:var(--dim2);border-color:var(--line)}
+
+  .chips{display:flex;flex-wrap:wrap;gap:6px;margin-top:10px}
+  .chip{
+    background:transparent;
+    border:1px solid var(--line2);
+    color:var(--dim);
+    font-family:var(--mono);
+    font-size:12px;
+    padding:5px 10px;
+    border-radius:4px;
+    cursor:pointer;
+  }
+  .chip.on{border-color:#556372;color:var(--fg);background:var(--panel)}
+  .chip:disabled{opacity:.45;cursor:default}
+
+  .btns{display:flex;gap:8px;margin-top:12px}
+  .btn{
+    flex:1;
+    background:var(--panel);
+    border:1px solid var(--line2);
+    color:var(--fg);
+    font-family:var(--mono);
+    font-size:13px;
+    padding:9px 0;
+    border-radius:4px;
+    cursor:pointer;
+  }
+  .btn:disabled{opacity:.35;cursor:default}
+  .btn.go{border-color:#2f6b52;color:var(--up)}
+  .btn.stop{border-color:#6b3540;color:var(--dn)}
+
+  .hint{margin-top:10px;font-size:11px;color:var(--dim2);line-height:1.6}
+  .hint .warn{color:#d9a441}
+
+  .tape{display:flex;flex-wrap:wrap;gap:14px;font-size:11px;color:var(--dim)}
+  .tape b{font-weight:500;color:var(--fg)}
+  .dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dim2);margin-right:6px;vertical-align:1px}
+  .dot.live{background:var(--up)}
+  .dot.err{background:var(--dn)}
+
+  .card{
+    border:1px solid var(--line);
+    border-left:3px solid var(--dim2);
+    border-radius:4px;
+    padding:10px 12px;
+    margin-bottom:8px;
+    cursor:pointer;
+  }
+  .card.dead{opacity:.4}
+  .top{display:flex;justify-content:space-between;align-items:flex-start;gap:12px}
+  .rank{color:var(--dim2);margin-right:8px}
+  .nm{font-size:13px}
+  .desc{color:var(--dim2);font-size:11px;margin-top:2px}
+  .eq{text-align:right;white-space:nowrap}
+  .eqv{font-size:17px;letter-spacing:-.01em}
+  .pct{font-size:11px;margin-top:1px}
+  .bar{height:2px;background:var(--line);margin:9px 0 8px;border-radius:1px;overflow:hidden}
+  .bar i{display:block;height:100%}
+  .stats{display:flex;flex-wrap:wrap;gap:12px;font-size:11px;color:var(--dim2)}
+  .stats b{font-weight:400;color:var(--dim)}
+  .up{color:var(--up)}
+  .dn{color:var(--dn)}
+  .flat{color:var(--dim)}
+
+  .detail{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
+  .dh{color:var(--dim2);font-size:11px;margin-bottom:5px}
+  table{width:100%;border-collapse:collapse;font-size:11px}
+  td,th{padding:3px 0;text-align:right;white-space:nowrap;font-weight:400}
+  th{color:var(--dim2)}
+  td:first-child,th:first-child{text-align:left}
+  tbody tr td{border-top:1px solid #161b21}
+  .none{color:var(--dim2);font-size:11px}
+  footer{padding:14px 0;color:var(--dim2);font-size:11px}
+  @media (max-width:380px){
+    .stats{gap:9px}
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>策略竞技场</h1>
+  <div class="sub">Binance USDT-M · 同一行情 · 各自记账</div>
+</header>
+
+<section>
+  <div class="grid">
+    <label><div class="lbl">本金 USDT</div><input id="cap" type="number" value="1000" min="10" step="10"></label>
+    <label><div class="lbl">杠杆</div><input id="lev" type="number" value="50" min="1" max="125" step="1"></label>
+    <label><div class="lbl">单笔风险 %</div><input id="risk" type="number" value="6" min="0.1" max="50" step="0.1"></label>
+    <label><div class="lbl">K 线周期</div>
+      <select id="tf"><option value="1m">1m</option><option value="3m">3m</option><option value="5m" selected>5m</option></select>
+    </label>
+  </div>
+  <div class="chips" id="chips"></div>
+  <div class="btns">
+    <button class="btn go" id="bGo">开始</button>
+    <button class="btn stop" id="bStop" disabled>停止</button>
+    <button class="btn" id="bReset">重置</button>
+  </div>
+  <div class="hint" id="hint"></div>
+</section>
+
+<section>
+  <div class="tape" id="tape"><span><span class="dot"></span>未连接</span></div>
+</section>
+
+<div id="board"></div>
+
+<footer id="foot">虚拟撮合：taker 0.036% · 逐仓维持保证金阶梯 · 8 小时资金费 0.01% · 数量步进与最小名义额按交易所规则拒单。</footer>
+
+<script>
+'use strict';
+
+/* ───────────────────────── 交易所参数 ───────────────────────── */
+
+var TAKER = 0.0005 * 0.90 * 0.80;   // 0.000360
+var MAKER = 0.0002 * 0.90 * 0.80;   // 0.000144
+var FUND_RATE = 0.0001;             // 每 8 小时
+var MAX_BARS = 200;                 // 持仓超时
+var MAX_POS  = 3;                   // 同时持仓上限
+var DAY_DD   = 0.06;                // 当日回撤熔断
+var DEAD_EQ  = 3;                   // 出局线
+
+var SPEC = {
+  BTCUSDT : {tick:0.1,     step:0.001, minQty:0.001, minNotional:100, depth:2000000},
+  ETHUSDT : {tick:0.01,    step:0.001, minQty:0.001, minNotional:20,  depth:1000000},
+  SOLUSDT : {tick:0.01,    step:1,     minQty:1,     minNotional:5,   depth:300000},
+  DOGEUSDT: {tick:0.00001, step:1,     minQty:1,     minNotional:5,   depth:200000},
+  XRPUSDT : {tick:0.0001,  step:0.1,   minQty:0.1,   minNotional:5,   depth:250000},
+  BNBUSDT : {tick:0.01,    step:0.01,  minQty:0.01,  minNotional:5,   depth:300000}
+};
+var SYMS = Object.keys(SPEC);
+
+// 维持保证金阶梯：[名义额上限, 维持保证金率, 速算额]
+var MM_TIERS = [
+  [50000,    0.0040, 0],
+  [500000,   0.0050, 50],
+  [1000000,  0.0100, 2550],
+  [Infinity, 0.0250, 17550]
+];
+function mmTier(notional){
+  for(var i=0;i<MM_TIERS.length;i++) if(notional<=MM_TIERS[i][0]) return MM_TIERS[i];
+  return MM_TIERS[MM_TIERS.length-1];
+}
+
+function roundTick(px,tick){ return Math.round(px/tick)*tick; }
+function floorStep(q,step){ return Math.floor(q/step + 1e-9)*step; }
+function slipOf(notional,depth){ return 0.00005 + 0.0015*Math.sqrt(notional/depth); }
+
+/* ───────────────────────── 指标 ───────────────────────── */
+
+function hhll(bars,lb){                       // 前 lb 根（不含刚收盘那根）的高低
+  var n=bars.length, hi=-Infinity, lo=Infinity;
+  if(n < lb+1) return null;
+  for(var i=n-1-lb;i<n-1;i++){ if(bars[i].h>hi)hi=bars[i].h; if(bars[i].l<lo)lo=bars[i].l; }
+  return {hi:hi,lo:lo};
+}
+function breakout(bk,lb){                     // +1 向上破 / −1 向下破 / 0
+  var r=hhll(bk.bars,lb); if(!r) return 0;
+  var c=bk.bars[bk.bars.length-1].c;
+  if(c>r.hi) return 1;
+  if(c<r.lo) return -1;
+  return 0;
+}
+function zscore(bk,lb){
+  var b=bk.bars, n=b.length;
+  if(n<lb) return null;
+  var s=0,i;
+  for(i=n-lb;i<n;i++) s+=b[i].c;
+  var m=s/lb, v=0;
+  for(i=n-lb;i<n;i++) v+=(b[i].c-m)*(b[i].c-m);
+  var sd=Math.sqrt(v/lb);
+  if(!(sd>0)) return null;
+  return (b[n-1].c-m)/sd;
+}
+function volSpike(bk,lb,mult){
+  var b=bk.bars, n=b.length;
+  if(n<lb+1) return false;
+  var s=0;
+  for(var i=n-1-lb;i<n-1;i++) s+=b[i].v;
+  return b[n-1].v >= (s/lb)*mult;
+}
+
+/* ───────────────────────── 策略表 ─────────────────────────
+   要加策略，往 STRATS 里再推一条即可：
+   {id, name, desc, color, p:{sl,tp,trail,lb,trend}, sig(book,bar) → +1/−1/0}
+   book = {sym, bars, regime}   bars 末尾是刚收盘那根
+------------------------------------------------------------ */
+
+var STRATS = [
+  { id:'brk20', name:'突破 20', desc:'顺 1H 趋势，收盘突破前 20 根高低点', color:'#3ecf8e',
+    p:{sl:0.006,tp:0.015,trail:0.004,lb:20,trend:1},
+    sig:function(bk){ var s=breakout(bk,20); return (s && s===bk.regime) ? s : 0; } },
+
+  { id:'brk10', name:'突破 10', desc:'同上，回看缩短到 10 根，进出更快', color:'#57a9ff',
+    p:{sl:0.005,tp:0.012,trail:0.003,lb:10,trend:1},
+    sig:function(bk){ var s=breakout(bk,10); return (s && s===bk.regime) ? s : 0; } },
+
+  { id:'brkraw', name:'突破 无过滤', desc:'不看趋势，破 20 根高低点双向都做', color:'#c084fc',
+    p:{sl:0.006,tp:0.015,trail:0.004,lb:20,trend:0},
+    sig:function(bk){ return breakout(bk,20); } },
+
+  { id:'rev', name:'反转', desc:'破 20 根后反向进场，赌假突破回吞', color:'#f472b6',
+    p:{sl:0.006,tp:0.015,trail:0.004,lb:20,trend:0},
+    sig:function(bk){ return -breakout(bk,20); } },
+
+  { id:'mr', name:'均值回归', desc:'20 根 z < −2 做多，z > 2 做空', color:'#22d3ee',
+    p:{sl:0.008,tp:0.012,trail:0.004,lb:20,trend:0},
+    sig:function(bk){ var z=zscore(bk,20); if(z===null) return 0; if(z<-2) return 1; if(z>2) return -1; return 0; } },
+
+  { id:'pull', name:'顺势回踩', desc:'趋势向上且 z < −1.5 买入，向下反之', color:'#fbbf24',
+    p:{sl:0.006,tp:0.015,trail:0.004,lb:20,trend:1},
+    sig:function(bk){
+      var z=zscore(bk,20); if(z===null||!bk.regime) return 0;
+      if(bk.regime===1  && z<-1.5) return 1;
+      if(bk.regime===-1 && z> 1.5) return -1;
+      return 0; } },
+
+  { id:'vbrk', name:'放量突破', desc:'顺趋势破 20 根，且量 ≥ 10 根均量 ×3', color:'#fb923c',
+    p:{sl:0.006,tp:0.020,trail:0.005,lb:20,trend:1},
+    sig:function(bk){
+      var s=breakout(bk,20);
+      if(!s || s!==bk.regime) return 0;
+      return volSpike(bk,10,3) ? s : 0; } },
+
+  { id:'wide', name:'宽止损', desc:'顺趋势破 20 根，止损放宽仓位相应缩小', color:'#94a3b8',
+    p:{sl:0.015,tp:0.040,trail:0.010,lb:20,trend:1},
+    sig:function(bk){ var s=breakout(bk,20); return (s && s===bk.regime) ? s : 0; } }
+];
+
+/* ───────────────────────── 状态 ───────────────────────── */
+
+var cfg = {cap:1000, lev:10, risk:0.06, tf:'5m', syms:['BTCUSDT','ETHUSDT','SOLUSDT']};
+var picked = {BTCUSDT:true, ETHUSDT:true, SOLUSDT:true, DOGEUSDT:false, XRPUSDT:false, BNBUSDT:false};
+
+var ws=null, running=false, wsState='idle', retryT=null;
+var books={}, mark={}, accts=[], startAt=0, bars=0, msgs=0, fundSlot=null, warming=false;
+var expanded={};
+var $board=document.getElementById('board'), $tape=document.getElementById('tape');
+
+function newBook(sym){
+  return {sym:sym, bars:[], curKey:null, h1:{ema20:null,ema50:null,n:0}, regime:0, price:0};
+}
+function newAcct(s){
+  return {
+    id:s.id, s:s,
+    wallet:cfg.cap, used:0, pos:[], trades:[],
+    n:0, win:0, gp:0, gl:0, fees:0, funding:0,
+    peak:cfg.cap, maxdd:0,
+    day:null, dayPeak:cfg.cap, halted:false, dead:false
+  };
+}
+function resetAll(){
+  books={}; mark={}; accts=[]; bars=0; msgs=0; fundSlot=null; startAt=0; expanded={};
+  cfg.syms.forEach(function(s){ books[s]=newBook(s); });
+  STRATS.forEach(function(s){ accts.push(newAcct(s)); });
+  render();
+}
+
+/* ───────────────────────── 记账核心 ───────────────────────── */
+
+function unreal(p){ return p.side*(mark[p.sym]-p.entry)*p.qty; }
+function equity(a){
+  var e=a.wallet;
+  for(var i=0;i<a.pos.length;i++) e+=unreal(a.pos[i]);
+  return e;
+}
+function avail(a){ return a.wallet - a.used; }
+
+function liqPrice(side,entry,qty,margin){
+  var t=mmTier(entry*qty), mmr=t[1], amt=t[2];
+  return (side*entry*qty - margin - amt) / (qty*(side-mmr));
+}
+
+function openPos(a,sym,side,ref,ts){
+  var sp=SPEC[sym], P=a.s.p;
+  var eq=equity(a);
+  var notional = eq * cfg.risk / P.sl;
+  var qty = floorStep(notional/ref, sp.step);
+  if(qty < sp.minQty) return;
+  if(qty*ref < sp.minNotional) return;
+
+  var slip = slipOf(qty*ref, sp.depth);
+  var px = roundTick(ref*(1+side*slip), sp.tick);
+  if(!(px>0)) return;
+
+  var not = px*qty;
+  var margin = not/cfg.lev;
+  var fee = not*TAKER;
+  if(margin + fee > avail(a)) return;
+
+  a.wallet -= fee; a.used += margin; a.fees += fee;
+  a.pos.push({
+    sym:sym, side:side, qty:qty, qty0:qty, entry:px, margin:margin,
+    entryFee:fee, liq:liqPrice(side,px,qty,margin),
+    stop: px*(1 - side*P.sl), stage:0, peak:0, bars:0, t:ts
+  });
+}
+
+function closePart(a,p,q,ref,reason,ts){
+  var sp=SPEC[p.sym];
+  q = Math.min(q, p.qty);
+  var slip = slipOf(q*ref, sp.depth);
+  var px = roundTick(ref*(1 - p.side*slip), sp.tick);
+  var gross = p.side*(px-p.entry)*q;
+  var fee = px*q*TAKER;
+  var mPart = p.margin * (q/p.qty);
+
+  a.wallet += gross - fee;
+  a.used -= mPart; if(a.used<0) a.used=0;
+  a.fees += fee;
+  p.margin -= mPart;
+  p.qty -= q;
+
+  var pnl = gross - fee - p.entryFee*(q/p.qty0);
+  record(a,p,px,q,pnl,reason,ts);
+
+  if(p.qty > 0){
+    p.liq = liqPrice(p.side,p.entry,p.qty,p.margin);
+  } else {
+    drop(a,p);
+  }
+}
+
+function liquidate(a,p,ts){
+  a.wallet -= p.margin;
+  a.used -= p.margin; if(a.used<0) a.used=0;
+  record(a,p,p.liq,p.qty,-p.margin,'强平',ts);
+  p.qty=0; drop(a,p);
+}
+
+function drop(a,p){
+  var i=a.pos.indexOf(p); if(i>=0) a.pos.splice(i,1);
+}
+
+function record(a,p,px,q,pnl,reason,ts){
+  a.n++;
+  if(pnl>0){ a.win++; a.gp+=pnl; } else { a.gl+=-pnl; }
+  a.trades.push({t:ts, sym:p.sym, side:p.side, qty:q, entry:p.entry, exit:px, pnl:pnl, why:reason});
+  if(a.trades.length>60) a.trades.shift();
+}
+
+/* 逐笔风控：强平 → 止损 → 止盈分批 → 保本上移 → 追踪 */
+function riskCheck(a,p,px,ts){
+  if(p.qty<=0) return;
+  var P=a.s.p, s=p.side;
+
+  var hitLiq  = (s===1 && px<=p.liq)  || (s===-1 && px>=p.liq);
+  var hitStop = (s===1 && px<=p.stop) || (s===-1 && px>=p.stop);
+  if(hitLiq && hitStop){
+    // 两者同时被击穿时，按价格路径先触及的那个成交：多头取较高价，空头取较低价
+    if(s===1 ? p.stop>p.liq : p.stop<p.liq) hitLiq=false; else hitStop=false;
+  }
+  if(hitLiq){ liquidate(a,p,ts); return; }
+  if(hitStop){
+    var why = p.stage===0 ? '止损' : (p.stage===1 ? '保本' : '锁利');
+    closePart(a,p,p.qty,px,why,ts); return;
+  }
+
+  var prof = s*(px-p.entry)/p.entry;
+
+  if(p.stage<2 && prof>=P.tp){
+    var sp=SPEC[p.sym];
+    var half = floorStep(p.qty*0.6, sp.step);
+    if(half>=sp.minQty && (p.qty-half)>=sp.minQty && (p.qty-half)*px>=sp.minNotional){
+      closePart(a,p,half,px,'平半',ts);
+      if(p.qty<=0) return;
+    }
+    p.stage=2;
+    p.stop = p.entry*(1 + s*P.sl*1.33);
+    p.peak = prof;
+    return;
+  }
+  if(p.stage===0 && prof>=P.sl){
+    p.stage=1;
+    p.stop = p.entry*(1 + s*0.001);
+  }
+  if(p.stage===2){
+    if(prof>p.peak) p.peak=prof;
+    if(p.peak-prof >= P.trail){ closePart(a,p,p.qty,px,'追踪',ts); return; }
+  }
+}
+
+function funding(ts){
+  var slot = Math.floor(ts/28800000);
+  if(fundSlot===null){ fundSlot=slot; return; }
+  if(slot===fundSlot) return;
+  fundSlot=slot;
+  accts.forEach(function(a){
+    a.pos.forEach(function(p){
+      var pay = p.side*FUND_RATE*p.qty*mark[p.sym];
+      a.wallet -= pay; a.funding += pay;
+    });
+  });
+}
+
+function guard(a,ts){
+  var eq=equity(a);
+  if(eq>a.peak) a.peak=eq;
+  var dd=(a.peak-eq)/a.peak; if(dd>a.maxdd) a.maxdd=dd;
+
+  var day = Math.floor(ts/86400000);
+  if(a.day!==day){ a.day=day; a.dayPeak=eq; a.halted=false; }
+  if(eq>a.dayPeak) a.dayPeak=eq;
+  if((a.dayPeak-eq)/a.dayPeak >= DAY_DD) a.halted=true;
+  if(eq < DEAD_EQ) a.dead=true;
+}
+
+/* ───────────────────────── 行情驱动 ───────────────────────── */
+
+function onPrice(sym,px,ts){
+  mark[sym]=px;
+  if(books[sym]) books[sym].price=px;
+  if(warming) return;
+  funding(ts);
+  for(var i=0;i<accts.length;i++){
+    var a=accts[i];
+    for(var j=a.pos.length-1;j>=0;j--){
+      var p=a.pos[j];
+      if(p.sym===sym) riskCheck(a,p,px,ts);
+    }
+    guard(a,ts);
+  }
+}
+
+function onBarClose(sym,bar,live){
+  var bk=books[sym]; if(!bk) return;
+  bk.bars.push(bar);
+  if(bk.bars.length>400) bk.bars.shift();
+  if(live) bars++;
+  if(!live) return;
+
+  var ts=bar.T;
+  // 用极值补一次盘中风控，再用收盘价
+  var i,j,a,p;
+  for(i=0;i<accts.length;i++){
+    a=accts[i];
+    for(j=a.pos.length-1;j>=0;j--){
+      p=a.pos[j];
+      if(p.sym!==sym) continue;
+      p.bars++;
+      riskCheck(a,p, p.side===1?bar.l:bar.h, ts);
+      if(p.qty>0) riskCheck(a,p, p.side===1?bar.h:bar.l, ts);
+      if(p.qty>0) riskCheck(a,p, bar.c, ts);
+      if(p.qty>0 && p.bars>=MAX_BARS) closePart(a,p,p.qty,bar.c,'超时',ts);
+    }
+  }
+  mark[sym]=bar.c;
+
+  // 开仓
+  for(i=0;i<accts.length;i++){
+    a=accts[i];
+    if(a.dead || a.halted) continue;
+    if(a.pos.length>=MAX_POS) continue;
+    var held=false;
+    for(j=0;j<a.pos.length;j++) if(a.pos[j].sym===sym) held=true;
+    if(held) continue;
+    var sig=0;
+    try{ sig=a.s.sig(bk,bar)|0; }catch(e){ sig=0; }
+    if(sig===1||sig===-1) openPos(a,sym,sig,bar.c,ts);
+    guard(a,ts);
+  }
+}
+
+function onH1Close(sym,bar){
+  var bk=books[sym]; if(!bk) return;
+  var h=bk.h1, c=bar.c;
+  h.ema20 = h.ema20===null ? c : c*(2/21) + h.ema20*(1-2/21);
+  h.ema50 = h.ema50===null ? c : c*(2/51) + h.ema50*(1-2/51);
+  h.n++;
+  if(h.n<50){ bk.regime=0; return; }
+  if(c>h.ema20 && h.ema20>h.ema50) bk.regime=1;
+  else if(c<h.ema20 && h.ema20<h.ema50) bk.regime=-1;
+  else bk.regime=0;
+}
+
+/* ───────────────────────── WebSocket ───────────────────────── */
+
+function connect(){
+  var streams=[];
+  cfg.syms.forEach(function(s){
+    var l=s.toLowerCase();
+    streams.push(l+'@kline_'+cfg.tf);
+    streams.push(l+'@kline_1h');
+  });
+  var url='wss://fstream.binance.com/stream?streams='+streams.join('/');
+  wsState='connecting'; render();
+  try{ ws=new WebSocket(url); }catch(e){ wsState='error'; schedule(); return; }
+
+  ws.onopen=function(){ wsState='live'; render(); };
+  ws.onmessage=function(ev){
+    var m;
+    try{ m=JSON.parse(ev.data); }catch(e){ return; }
+    var d=m && m.data;
+    if(!d || d.e!=='kline') return;
+    var k=d.k, sym=d.s;
+    msgs++;
+    var bar={t:k.t,T:k.T,o:+k.o,h:+k.h,l:+k.l,c:+k.c,v:+k.v};
+    var now=d.E||k.T;
+    // 预热未完成前只记价，避免历史与实时 K 线交错入库
+    if(warming){ mark[sym]=bar.c; if(books[sym]) books[sym].price=bar.c; render(); return; }
+    if(k.i==='1h'){
+      if(k.x) onH1Close(sym,bar);
+      render();
+      return;
+    }
+    if(k.i!==cfg.tf) return;
+    onPrice(sym,bar.c,now);
+    if(k.x) onBarClose(sym,bar,true);
+    render();
+  };
+  ws.onerror=function(){ wsState='error'; };
+  ws.onclose=function(){ ws=null; if(running){ wsState='down'; schedule(); } else { wsState='idle'; } render(); };
+}
+function schedule(){
+  if(retryT) clearTimeout(retryT);
+  retryT=setTimeout(function(){ if(running) connect(); },3000);
+}
+
+/* 预热：用公开 REST 把历史 K 线灌进去，否则 1H 趋势要等 50 小时才成立 */
+function warmup(done){
+  warming=true;
+  var pending=cfg.syms.length*2;
+  if(!pending){ warming=false; done(); return; }
+  function tick(){ if(--pending<=0){ warming=false; done(); } }
+  cfg.syms.forEach(function(sym){
+    fetchK(sym,cfg.tf,300,function(rows){
+      if(rows){
+        mark[sym]=rows[rows.length-1].c;
+        books[sym].price=mark[sym];
+        rows.slice(0,-1).forEach(function(b){ onBarClose(sym,b,false); });   // 末根未收盘，只取价
+      }
+      tick();
+    });
+    fetchK(sym,'1h',200,function(rows){
+      if(rows) rows.slice(0,-1).forEach(function(b){ onH1Close(sym,b); });
+      tick();
+    });
+  });
+}
+function fetchK(sym,iv,limit,cb){
+  var u='https://fapi.binance.com/fapi/v1/klines?symbol='+sym+'&interval='+iv+'&limit='+limit;
+  fetch(u).then(function(r){ return r.ok?r.json():null; }).then(function(j){
+    if(!j || !j.length){ cb(null); return; }
+    cb(j.map(function(r){ return {t:r[0],T:r[6],o:+r[1],h:+r[2],l:+r[3],c:+r[4],v:+r[5]}; }));
+  }).catch(function(){ cb(null); });
+}
+
+/* ───────────────────────── 控制 ───────────────────────── */
+
+var $=function(id){ return document.getElementById(id); };
+
+function readCfg(){
+  cfg.cap  = Math.max(10, +$('cap').value||1000);
+  cfg.lev  = Math.min(125, Math.max(1, Math.round(+$('lev').value||10)));
+  cfg.risk = Math.max(0.001, (+$('risk').value||6)/100);
+  cfg.tf   = $('tf').value;
+  cfg.syms = SYMS.filter(function(s){ return picked[s]; });
+  if(!cfg.syms.length){ picked.BTCUSDT=true; cfg.syms=['BTCUSDT']; }
+}
+function lock(on){
+  ['cap','lev','risk','tf'].forEach(function(id){ $(id).disabled=on; });
+  Array.prototype.forEach.call(document.querySelectorAll('.chip'),function(c){ c.disabled=on; });
+  $('bGo').disabled=on; $('bStop').disabled=!on; $('bReset').disabled=on;
+}
+function start(){
+  if(running) return;
+  readCfg(); resetAll();
+  running=true; startAt=Date.now(); lock(true);
+  warmup(function(){ render(); });
+  connect();
+}
+function stop(){
+  running=false; lock(false);
+  if(retryT){ clearTimeout(retryT); retryT=null; }
+  if(ws){ try{ ws.close(); }catch(e){} ws=null; }
+  wsState='idle'; render();
+}
+
+function buildChips(){
+  var h='';
+  SYMS.forEach(function(s){
+    h+='<button class="chip'+(picked[s]?' on':'')+'" data-sym="'+s+'">'+s.replace('USDT','')+'</button>';
+  });
+  $('chips').innerHTML=h;
+  Array.prototype.forEach.call(document.querySelectorAll('.chip'),function(c){
+    c.onclick=function(){
+      if(running) return;
+      var s=c.getAttribute('data-sym');
+      picked[s]=!picked[s];
+      if(!SYMS.some(function(x){return picked[x];})) picked[s]=true;
+      buildChips();
+    };
+  });
+}
+
+/* ───────────────────────── 渲染 ───────────────────────── */
+
+var rafPending=false;
+function render(){
+  if(rafPending) return;
+  rafPending=true;
+  requestAnimationFrame(function(){ rafPending=false; draw(); });
+}
+
+function fmt(n,d){
+  if(!isFinite(n)) return '—';
+  return n.toLocaleString('en-US',{minimumFractionDigits:d,maximumFractionDigits:d});
+}
+function pxDec(sym){
+  var t=SPEC[sym].tick, d=0, x=t;
+  while(x<1-1e-9 && d<8){ x*=10; d++; }
+  return d;
+}
+function fmtPx(sym,p){ return fmt(p,pxDec(sym)); }
+function clr(v){ return v>0?'up':(v<0?'dn':'flat'); }
+function sgn(v,d){ return (v>0?'+':'')+fmt(v,d); }
+function hhmm(t){
+  var x=new Date(t);
+  function p(n){ return (n<10?'0':'')+n; }
+  return p(x.getHours())+':'+p(x.getMinutes())+':'+p(x.getSeconds());
+}
+
+/* 名义额 = 权益 × 风险% / 止损%，所以杠杆太低会被保证金检查全部拒单 */
+function drawHint(){
+  var risk = Math.max(0.001,(+$('risk').value||6)/100);
+  var lev  = Math.max(1, Math.round(+$('lev').value||1));
+  var minSl=Infinity, maxSl=0;
+  STRATS.forEach(function(s){ if(s.p.sl<minSl)minSl=s.p.sl; if(s.p.sl>maxSl)maxSl=s.p.sl; });
+  var need = Math.ceil(MAX_POS*risk/minSl);
+  var one  = Math.ceil(risk/minSl);
+  var h = '名义额 = 权益 × 风险% ÷ 止损%，即权益的 '+fmt(risk/maxSl,1)+'–'+fmt(risk/minSl,1)+' 倍。';
+  if(lev<one)       h+=' <span class="warn">杠杆 '+lev+' 连一单的保证金都不够，会被全部拒单（需 ≥ '+one+'）。</span>';
+  else if(lev<need) h+=' <span class="warn">杠杆 '+lev+' 撑不满 '+MAX_POS+' 个并发仓位，后续单会拒（需 ≥ '+need+'）。</span>';
+  else              h+=' 当前杠杆可容纳 '+MAX_POS+' 个并发仓位。';
+  $('hint').innerHTML=h;
+}
+
+function drawTape(){
+  var s = wsState==='live' ? 'live' : (wsState==='error'||wsState==='down' ? 'err' : '');
+  var txt = {idle:'未连接',connecting:'连接中',live:'已连接',down:'重连中',error:'重连中'}[wsState]||'—';
+  var h='<span><span class="dot '+s+'"></span>'+txt+'</span>';
+  if(warming) h+='<span>预热历史中…</span>';
+  h+='<span>收盘 <b>'+bars+'</b></span><span>消息 <b>'+msgs+'</b></span>';
+  cfg.syms.forEach(function(sym){
+    var bk=books[sym]; if(!bk) return;
+    var r=bk.regime, rt=r===1?'<span class="up">↑</span>':(r===-1?'<span class="dn">↓</span>':'<span class="flat">·</span>');
+    h+='<span>'+sym.replace('USDT','')+' <b>'+(bk.price?fmtPx(sym,bk.price):'—')+'</b> '+rt+'</span>';
+  });
+  $tape.innerHTML=h;
+}
+
+function drawDetail(a){
+  var h='<div class="detail">';
+  h+='<div class="dh">持仓 '+a.pos.length+'/'+MAX_POS+(a.halted?' · 当日熔断':'')+'</div>';
+  if(!a.pos.length){ h+='<div class="none">无</div>'; }
+  else{
+    h+='<table><thead><tr><th>标的</th><th>方向</th><th>入场</th><th>现价</th><th>止损</th><th>浮盈</th></tr></thead><tbody>';
+    a.pos.forEach(function(p){
+      var u=unreal(p);
+      h+='<tr><td>'+p.sym.replace('USDT','')+'</td>'+
+         '<td class="'+(p.side===1?'up':'dn')+'">'+(p.side===1?'多':'空')+'</td>'+
+         '<td>'+fmtPx(p.sym,p.entry)+'</td>'+
+         '<td>'+fmtPx(p.sym,mark[p.sym]||0)+'</td>'+
+         '<td>'+fmtPx(p.sym,p.stop)+'</td>'+
+         '<td class="'+clr(u)+'">'+sgn(u,2)+'</td></tr>';
+    });
+    h+='</tbody></table>';
+  }
+  var tr=a.trades.slice(-14).reverse();
+  h+='<div class="dh" style="margin-top:10px">最近成交 '+(tr.length?tr.length:'')+'</div>';
+  if(!tr.length){ h+='<div class="none">无</div>'; }
+  else{
+    h+='<table><thead><tr><th>时间</th><th>标的</th><th>方向</th><th>出场</th><th>盈亏</th></tr></thead><tbody>';
+    tr.forEach(function(t){
+      h+='<tr><td>'+hhmm(t.t)+'</td>'+
+         '<td>'+t.sym.replace('USDT','')+'</td>'+
+         '<td class="'+(t.side===1?'up':'dn')+'">'+(t.side===1?'多':'空')+'</td>'+
+         '<td>'+t.why+'</td>'+
+         '<td class="'+clr(t.pnl)+'">'+sgn(t.pnl,2)+'</td></tr>';
+    });
+    h+='</tbody></table>';
+  }
+  return h+'</div>';
+}
+
+function draw(){
+  drawHint();
+  drawTape();
+
+  var rows=accts.map(function(a){ return {a:a, eq:equity(a)}; });
+  rows.sort(function(x,y){ return y.eq-x.eq; });
+  var best = rows.length ? Math.max(rows[0].eq, 1e-9) : 1;
+  var days = startAt ? Math.max((Date.now()-startAt)/86400000, 1/1440) : 0;
+
+  var h='';
+  rows.forEach(function(r,i){
+    var a=r.a, s=a.s, eq=r.eq;
+    var ret=(eq/cfg.cap-1)*100;
+    var pf = a.gl>0 ? a.gp/a.gl : (a.gp>0?Infinity:0);
+    var wr = a.n? a.win/a.n*100 : 0;
+    var w = Math.max(2, Math.min(100, eq/best*100));
+    h+='<div class="card'+(a.dead?' dead':'')+'" data-id="'+a.id+'" style="border-left-color:'+s.color+'">'+
+       '<div class="top"><div>'+
+         '<div class="nm"><span class="rank">'+(i+1)+'</span>'+s.name+(a.dead?' <span class="dn">已出局</span>':'')+'</div>'+
+         '<div class="desc">'+s.desc+'</div>'+
+       '</div><div class="eq">'+
+         '<div class="eqv">'+fmt(eq,2)+'</div>'+
+         '<div class="pct '+clr(ret)+'">'+sgn(ret,2)+'%</div>'+
+       '</div></div>'+
+       '<div class="bar"><i style="width:'+w.toFixed(2)+'%;background:'+s.color+'"></i></div>'+
+       '<div class="stats">'+
+         '<span>成交 <b>'+a.n+'</b></span>'+
+         '<span>胜率 <b>'+fmt(wr,0)+'%</b></span>'+
+         '<span>PF <b>'+(pf===Infinity?'∞':fmt(pf,2))+'</b></span>'+
+         '<span>回撤 <b>'+fmt(a.maxdd*100,1)+'%</b></span>'+
+         '<span>手续费 <b>'+fmt(a.fees,2)+'</b></span>'+
+         '<span>笔/天 <b>'+(days?fmt(a.n/days,1):'0.0')+'</b></span>'+
+       '</div>'+
+       (expanded[a.id]?drawDetail(a):'')+
+       '</div>';
+  });
+  $board.innerHTML=h;
+}
+
+$board.addEventListener('click',function(e){
+  var c=e.target.closest ? e.target.closest('.card') : null;
+  if(!c) return;
+  var id=c.getAttribute('data-id');
+  expanded[id]=!expanded[id];
+  draw();
+});
+
+['lev','risk'].forEach(function(id){ $(id).addEventListener('input',drawHint); });
+
+$('bGo').onclick=start;
+$('bStop').onclick=stop;
+$('bReset').onclick=function(){ if(running) return; readCfg(); resetAll(); };
+
+buildChips();
+readCfg();
+resetAll();
+setInterval(function(){ if(running) render(); },1000);
+</script>
+</body>
+</html>
