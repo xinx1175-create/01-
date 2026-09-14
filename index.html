@@ -398,7 +398,8 @@ function neededTF(){
 var cfg = {cap:50, lev:50, mult:1, src:'live', syms:['BTCUSDT','ETHUSDT','SOLUSDT']};
 var picked = {BTCUSDT:true, ETHUSDT:true, SOLUSDT:true, DOGEUSDT:false, XRPUSDT:false, BNBUSDT:false};
 
-var ws=null, running=false, wsState='idle', retryT=null, wsFails=0, warmOK=false, warming=false;
+var ws=null, running=false, wsState='idle', retryT=null, watchT=null, wsFails=0, warmOK=false, warming=false;
+var autoFell=false, gen=0;      // gen：换数据源后，在途的旧请求要作废
 var books={}, trend={}, mark={}, accts=[];
 var startAt=0, bars=0, msgs=0, fundSlot=null;
 var rej={}, expanded={}, tierFilt=0;
@@ -423,6 +424,8 @@ function resetAll(){
   books={}; trend={}; mark={}; accts=[];
   bars=0; msgs=0; fundSlot=null; startAt=0;
   rej={}; expanded={}; wsFails=0; warmOK=false; chartSym=null; chartTF=null;
+  gen++; warming=false;
+  if(demoT){ clearInterval(demoT); demoT=null; }
   var tfs=neededTF();
   cfg.syms.forEach(function(sym){
     books[sym]={};
@@ -709,7 +712,7 @@ function schedule(){
 var WARM = {'1m':500,'3m':500,'5m':400,'15m':300,'1h':200,'4h':200};
 function warmup(done){
   warming=true;
-  var tfs=neededTF(), jobs=[];
+  var g=gen, tfs=neededTF(), jobs=[];
   cfg.syms.forEach(function(sym){
     tfs.forEach(function(tf){ jobs.push([sym,tf,false]); });
     jobs.push([sym,'1h',true]); jobs.push([sym,'4h',true]);
@@ -718,6 +721,7 @@ function warmup(done){
   if(!pending){ warming=false; done(); return; }
   jobs.forEach(function(j){
     fetchK(j[0], j[1], WARM[j[1]]||300, function(rows){
+      if(g!==gen) return;                             // 数据源已切走，这批历史作废
       if(rows && rows.length>1){
         warmOK=true;
         var body=rows.slice(0,-1);                    // 末根未收盘
@@ -830,14 +834,36 @@ function lock(on){
 function start(){
   if(running) return;
   readCfg(); resetAll();
-  running=true; startAt=Date.now(); lock(true);
+  running=true; startAt=Date.now(); autoFell=false; lock(true);
   if(cfg.src==='demo'){ demoStart(); render(); return; }
+
   warmup(function(){ render(); });
   connect();
+
+  // 看门狗：连不上就自动切演示行情，而不是让页面干等
+  if(watchT) clearTimeout(watchT);
+  watchT=setTimeout(function(){
+    if(!running || cfg.src!=='live') return;
+    if(bars>0 && msgs>0) return;                  // 已经有行情进来了
+    fallbackToDemo();
+  }, 7000);
 }
+
+function fallbackToDemo(){
+  if(retryT){ clearTimeout(retryT); retryT=null; }
+  if(ws){ try{ ws.close(); }catch(e){} ws=null; }
+  var wasRunning=running;
+  running=false;
+  resetAll();                                     // gen++ 会让在途的 REST 回调作废
+  cfg.src='demo'; $('src').value='demo';
+  running=wasRunning; autoFell=true; startAt=Date.now();
+  demoStart(); render();
+}
+
 function stop(){
   running=false; lock(false);
   if(retryT){ clearTimeout(retryT); retryT=null; }
+  if(watchT){ clearTimeout(watchT); watchT=null; }
   if(demoT){ clearInterval(demoT); demoT=null; }
   if(ws){ try{ ws.close(); }catch(e){} ws=null; }
   wsState='idle'; render();
@@ -904,18 +930,20 @@ function drawNote(){
       '若你所在网络连不上 Binance，把数据源切到「演示行情」，整套撮合照样跑得起来。';
     return;
   }
-  if(warming){ $('note').innerHTML='正在拉取历史 K 线预热…'; return; }
-
-  if(cfg.src==='live' && wsState!=='live'){
-    $('note').innerHTML='<span class="warn">连不上 Binance 行情（已重试 '+wsFails+' 次）。</span> '+
-      '常见原因：所在地区或网络屏蔽了 fstream.binance.com；或页面被放在受限的预览框里，外部连接会被拦掉。'+
-      '把 HTML 下载下来用浏览器直接打开，或把数据源切到「演示行情」。';
+  if(cfg.src==='live' && !bars){
+    $('note').innerHTML='正在连接 Binance 实时行情…'+
+      '<span class="flat">连不上的话会在几秒内自动切到演示行情，不用你做任何事。</span>';
     return;
   }
+  if(warming){ $('note').innerHTML='正在拉取历史 K 线预热…'; return; }
 
   var h='', nT=0, nP=0, nH=0, nD=0;
   accts.forEach(function(a){ nT+=a.n; nP+=a.pos.length; if(a.halted)nH++; if(a.dead)nD++; });
-  h='<span class="ok">'+(cfg.src==='demo'?'演示行情运行中':'运行中')+'</span> · 持仓 '+nP+' · 累计成交 '+nT+'。';
+  h='<span class="ok">'+(cfg.src==='demo'?'演示行情运行中':'实时行情运行中')+'</span> · 持仓 '+nP+' · 累计成交 '+nT+'。';
+
+  if(autoFell) h+=' <span class="warn">连不上 Binance，已自动切到演示行情。</span>'+
+    '演示价格是本地生成的随机行情，只能验证撮合和界面，不能用来比较方案优劣。'+
+    '要用真实行情，把这个页面下载成 HTML 文件，用浏览器直接打开。';
 
   if(cfg.src==='live' && !warmOK)
     h+=' <span class="warn">历史预热失败</span>，趋势过滤要等实时累计满 50 根 1H / 4H K 线才生效。';
@@ -1168,6 +1196,9 @@ buildChips();
 readCfg();
 resetAll();
 setInterval(function(){ if(running) render(); },1000);
+
+// 打开即跑：先试真实行情，连不上自动切演示，不需要先点按钮
+start();
 </script>
 </body>
 </html>
