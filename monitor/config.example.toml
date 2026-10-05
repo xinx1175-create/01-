@@ -1,0 +1,112 @@
+# 资金流跟随策略 · 阶段一监控器 配置样例
+#
+# 规则：代码里没有任何默认值，下面每一项都必须写。少写或多写都会在启动时报错。
+# 「§n」指开发规格 v0.1 的第 n 节；标了「实现」的是规格没给、实现时必须定的值，
+# 改之前先看 README 的「实现时补充的约定」。
+
+[exchange]
+ws_public_url = "wss://ws.okx.com:8443/ws/v5/public"
+rest_base_url = "https://www.okx.com"
+inst_id = "BTC-USDT-SWAP"                 # §2 只做这一个
+inst_type = "SWAP"
+rest_timeout_s = 10                       # 实现：合约信息接口超时
+
+[connection]
+ping_interval_s = 15                      # §12 定时发文本 "ping"；官方要求 30 秒内必须有往来
+pong_timeout_s = 10                       # 实现：发出 ping 后多久没收到 pong 视为异常
+stale_reconnect_s = 5                     # §12 超过 5 秒没收到行情，主动重连
+reconnect_backoff_min_s = 1               # 实现：重连退避起点
+reconnect_backoff_max_s = 30              # 实现：重连退避上限
+reconnect_fail_notify = 5                 # 实现：连续重连失败几次推送通知
+subscribe_timeout_s = 10                  # 实现：订阅后多久没收到盘口快照算这次连接失败
+
+[bucket]
+width_s = 15                              # §5 / §13 数据桶宽度
+close_grace_ms = 500                      # 实现：桶结束后再等多久才封桶，给晚到的推送留时间
+fallback_close_lag_ms = 1500              # 实现：完全没行情时，按本地时钟兜底封桶的额外延迟
+oi_stale_s = 30                           # §6 / §13 持仓量超过 30 秒没更新，该桶不完整
+near_depth_pct = 0.2                      # §5 / §13 现价上下 0.2% 内的挂单
+cancel_range_pct = 0.2                    # 实现：撤单量只统计离中间价这个范围内的价位
+snapshot_levels = 50                      # §5 每个桶结束时存前 50 档
+
+[score]                                   # §6 力量分数
+flow_window_buckets = 4                   # 成交方向窗口 4 个桶（1 分钟）
+oi_window_buckets = 20                    # 持仓量变化窗口 20 个桶（5 分钟）
+baseline_hours = 24                       # 基准值回看时长
+baseline_min_coverage = 0.8               # 实现：24 小时窗口里完整桶至少占多少，基准值才算有效
+volume_multiple_cap = 3                   # 成交量倍数上限
+oi_z_divisor = 3                          # 持仓量 Z 值除数
+weight_flow = 0.5                         # 成交分项权重
+weight_oi = 0.5                           # 持仓分项权重
+no_new_money_cap = 30                     # 无新资金时的分数上限
+price_disagree_factor = 0.5               # 价格不配合时的系数
+smooth_buckets = 4                        # 平滑窗口
+
+[rules]                                   # §7 仓位与离场。阶段一只用来给信号事件记“之后何时触发”
+entry_threshold = 40
+add_thresholds = [60, 75]
+halve_threshold = 35
+exit_threshold = 15
+position_tiers = [0.5, 0.8, 1.0]          # 阶段二使用
+full_margin_usdt = 60                     # 阶段二使用
+leverage = 20                             # 阶段二使用，§2 不超过 20 倍
+max_loss_usdt_by_tier = [3, 6, 10]        # 阶段二使用
+time_stop_minutes = 10                    # 阶段二使用
+time_stop_profit_pct = 0.1                # 阶段二使用
+cooldown_after_win_minutes = 2            # 阶段二使用
+cooldown_after_loss_minutes = 5           # 阶段二使用
+
+[conditions]                              # §8 不交易条件（阶段一只记录）
+low_vol_window_minutes = 30
+low_vol_lookback_days = 7
+low_vol_percentile = 30
+flip_window_minutes = 30
+flip_count = 3
+calendar_file = "calendar.csv"            # 手工维护的经济数据日程，相对本配置文件
+calendar_before_minutes = 15
+calendar_after_minutes = 30
+loss_streak_count = 2                     # 阶段二使用：连续 2 次亏损清仓
+loss_streak_pause_minutes = 30            # 阶段二使用
+
+[risk]                                    # §8 风控上限，阶段二使用
+capital_usdt = 200
+max_margin_usdt = 60
+max_loss_half_usdt = 3
+max_loss_full_usdt = 10
+max_consecutive_losses = 3
+consecutive_loss_pause_hours = 2
+max_daily_loss_usdt = 12
+max_weekly_loss_usdt = 24
+min_equity_usdt = 140
+
+[fees]                                    # §9 阶段二使用
+maker_rate = 0.0002
+taker_rate = 0.0005
+
+[events]                                  # §10 信号事件
+tiers = [30, 40, 50]                      # 记录穿越的档位；40 是进场门槛
+followup_minutes = 30
+price_horizons_s = [15, 60, 120, 300, 900, 1800]
+limit_fill_windows_s = [5, 15]
+market_order_notional_usdt = 600
+control_per_hour = 1                      # 对照组：每小时随机抽 1 个没有信号的时刻
+control_seed = "flowmon-v0.1"             # 实现：抽样种子。同一份数据回放时抽到同一批时刻
+
+[storage]
+data_dir = "data"                         # 相对本配置文件
+log_dir = "logs"
+restore_days = 7                          # 实现：重启时读回最近几天的桶，恢复基准值和 7 天分位
+raw_flush_s = 15                          # 实现：原始数据最多攒多久写一次盘
+log_keep_days = 30                        # 实现：日志按天切分，保留多少天
+
+[health]
+disk_check_interval_s = 600
+disk_min_free_gb = 2
+daily_report = true
+
+[notify]                                  # §12 推送到手机
+kind = "none"                             # none | ntfy | bark | webhook
+url = ""                                  # ntfy: https://ntfy.sh/你的主题  bark: https://api.day.app/你的key
+on_start = true
+daily_summary = true
+min_interval_s = 3600                     # 实现：同一类告警最短间隔
