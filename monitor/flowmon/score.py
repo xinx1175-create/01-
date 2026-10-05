@@ -51,33 +51,41 @@ class ScoreResult:
 
 
 class _Window:
-    """按时间滑动的窗口，维护和与平方和；每装满一轮重算一次，避免浮点累积误差。"""
+    """滑动窗口：只留最近 cap 个值，且都在 span_ms 之内；维护和与平方和，每装满一轮重算一次，避免浮点累积误差。"""
 
-    def __init__(self, span_ms: int, resync_every: int):
+    def __init__(self, span_ms: int, cap: int):
         self.span = span_ms
+        self.cap = max(1, cap)
         self.q: deque[tuple[int, float]] = deque()
         self.s = 0.0
         self.s2 = 0.0
-        self.resync_every = max(1, resync_every)
         self.ops = 0
+
+    def _pop(self) -> None:
+        _, x = self.q.popleft()
+        self.s -= x
+        self.s2 -= x * x
+        self.ops += 1
+
+    def _resync(self) -> None:
+        if self.ops >= self.cap:
+            self.s = math.fsum(x for _, x in self.q)
+            self.s2 = math.fsum(x * x for _, x in self.q)
+            self.ops = 0
 
     def expire(self, now_start: int) -> None:
         cut = now_start - self.span
-        q = self.q
-        while q and q[0][0] <= cut:
-            _, x = q.popleft()
-            self.s -= x
-            self.s2 -= x * x
-            self.ops += 1
-        if self.ops >= self.resync_every:
-            self.s = math.fsum(x for _, x in q)
-            self.s2 = math.fsum(x * x for _, x in q)
-            self.ops = 0
+        while self.q and self.q[0][0] <= cut:
+            self._pop()
+        self._resync()
 
     def add(self, t: int, x: float) -> None:
         self.q.append((t, x))
         self.s += x
         self.s2 += x * x
+        while len(self.q) > self.cap:
+            self._pop()
+        self._resync()
 
     def __len__(self) -> int:
         return len(self.q)
@@ -96,10 +104,13 @@ class ScoreEngine:
         self.width_s = width_s
         self.w = width_s * 1000
         self.n_base = max(1, round(cfg.baseline_hours * 3600 / width_s))
-        span = self.n_base * self.w
-        self.vol = _Window(span, self.n_base)      # 完整桶的成交量
-        self.doi = _Window(span, self.n_base)      # 持仓量变化量序列
-        self.seen: deque[int] = deque()            # 喂进来的所有桶（含不完整）
+        # 基准值用「最近 baseline_hours 的有效数据」：最近 n_base 个完整桶，最远回看 baseline_lookback_hours。
+        # 连续运行时就是过去 24 小时；停机重启后可以接着用停机前存下的数据，不用重新等 24 小时。
+        # baseline_lookback_hours 等于 baseline_hours 时，就是严格的「过去 24 小时」
+        look = max(self.n_base, round(cfg.baseline_lookback_hours * 3600 / width_s)) * self.w
+        self.vol = _Window(look, self.n_base)      # 完整桶的成交量
+        self.doi = _Window(look, self.n_base)      # 持仓量变化量序列
+        self.first_start: int | None = None        # 喂进来的第一个桶（含不完整和停机占位桶）
         keep = max(cfg.flow_window_buckets, cfg.oi_window_buckets, cfg.smooth_buckets) + 1
         self.keep_ms = keep * self.w
         self.recent: dict[int, tuple[bool, float, float, float | None, float | None]] = {}
@@ -107,8 +118,9 @@ class ScoreEngine:
         self.last_start: int | None = None
 
     def baseline_ready(self, s: int) -> bool:
-        """基准值有效：历史铺满整个回看时长，且其中完整桶的占比够。"""
-        if not self.seen or self.seen[0] > s - (self.n_base - 1) * self.w:
+        """基准值有效：已经记录了至少 baseline_hours（首次启动要等满 24 小时），且回看范围内的完整桶
+        至少有 n_base × baseline_min_coverage 个。重启后第一条已经满足，只看第二条。"""
+        if self.first_start is None or self.first_start > s - (self.n_base - 1) * self.w:
             return False
         return len(self.vol) >= self.cfg.baseline_min_coverage * self.n_base
 
@@ -121,9 +133,8 @@ class ScoreEngine:
         w = self.w
 
         # 窗口过期
-        cut = s - self.n_base * w
-        while self.seen and self.seen[0] <= cut:
-            self.seen.popleft()
+        if self.first_start is None:
+            self.first_start = s
         self.vol.expire(s)
         self.doi.expire(s)
         for d in (self.recent, self.r_hist):
@@ -135,7 +146,6 @@ class ScoreEngine:
         sell = row["sell_vol"] or 0.0
         close = row["close"]
         oi = row["oi"]
-        self.seen.append(s)
         self.recent[s] = (complete, buy, sell, close, oi)
         if complete:
             self.vol.add(s, buy + sell)

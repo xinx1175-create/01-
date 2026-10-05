@@ -7,7 +7,8 @@
 - 撤单量需要完整的盘口增量，原始数据里没有存，回放时为空。
 - 近处挂单只能用存下的前 N 档算，范围铺不满时偏小（near_truncated=1）。
 - 数据延迟只用逐笔成交算（实时还包含盘口推送）。
-- 完整性沿用实时记录：实时判为不完整的时段，回放也判为不完整；实时没在运行的时段直接跳过。
+- 完整性沿用实时记录：实时判为不完整的时段，回放也判为不完整；实时重启时补写的停机占位桶（downtime），
+  回放也生成同样的占位桶；连占位桶都没有的时段（例如回放范围外）直接跳过。
 - 实时里封桶后才到的成交（late_trades）回放时会算进它本该在的桶。
 """
 from __future__ import annotations
@@ -19,7 +20,7 @@ from datetime import date, timedelta
 from pathlib import Path
 from typing import Iterator
 
-from .bucket import Bucket, capture_from_levels, day_of, pick_oi
+from .bucket import DOWNTIME, Bucket, capture_from_levels, day_of, downtime_row, pick_oi
 from .conditions import Calendar, Conditions
 from .config import Config
 from .events import EventEngine, public
@@ -144,18 +145,23 @@ class Replayer:
                 stats["skipped"] += 1
                 return
             ok, why = cov
-            b.reasons = set() if ok else (why or {"incomplete"})
-            if book_last is not None and int(book_last["t"]) > s:
-                bk = book_last
-                b.capture = capture_from_levels(bk["bids"], bk["asks"], bk.get("ts"), bk.get("seq"),
-                                                cfg.bucket)
-            b.cancel_tracked = False
-            k = bisect.bisect_left(funding, (e, float("-inf")))
-            fr = funding[k - 1][1] if k > 0 else None
-            row = b.finish(prev_close, pick_oi(oi, e), fr, self.ct, int(cfg.bucket.oi_stale_s * 1000),
-                           judge=False)
-            if row["close"] is not None:
-                prev_close = row["close"]
+            if why == {DOWNTIME} and b.trade_msgs == 0:
+                # 实时停机期间补写的占位桶：和实时一样没有价格，也不更新「上一个收盘」
+                b.capture = None
+                row = downtime_row(s, w)
+            else:
+                b.reasons = set() if ok else (why or {"incomplete"})
+                if book_last is not None and int(book_last["t"]) > s:
+                    bk = book_last
+                    b.capture = capture_from_levels(bk["bids"], bk["asks"], bk.get("ts"), bk.get("seq"),
+                                                    cfg.bucket)
+                b.cancel_tracked = False
+                k = bisect.bisect_left(funding, (e, float("-inf")))
+                fr = funding[k - 1][1] if k > 0 else None
+                row = b.finish(prev_close, pick_oi(oi, e), fr, self.ct, int(cfg.bucket.oi_stale_s * 1000),
+                               judge=False)
+                if row["close"] is not None:
+                    prev_close = row["close"]
             sc = score.update(row)
             cd = cond.update(row, sc.valid, sc.S)
             full = {**row, **sc.as_row(), **cd}

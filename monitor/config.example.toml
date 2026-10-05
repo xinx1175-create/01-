@@ -32,8 +32,10 @@ snapshot_levels = 50                      # §5 每个桶结束时存前 50 档
 [score]                                   # §6 力量分数
 flow_window_buckets = 4                   # 成交方向窗口 4 个桶（1 分钟）
 oi_window_buckets = 20                    # 持仓量变化窗口 20 个桶（5 分钟）
-baseline_hours = 24                       # 基准值回看时长
-baseline_min_coverage = 0.8               # 实现：24 小时窗口里完整桶至少占多少，基准值才算有效
+baseline_hours = 24                       # 基准值回看时长：用最近 24 小时的有效数据（最近 24 小时的完整桶）
+baseline_lookback_hours = 48              # 实现：凑这 24 小时有效数据最远往回找多久。停机重启后接着用停机前的数据，
+                                          #   停机不超过 28.8 小时（48 − 24×0.8）重启后几分钟分数就有效；改成 24 即严格的「过去 24 小时」
+baseline_min_coverage = 0.8               # 实现：回看范围里的完整桶至少要有 24 小时的 80%，基准值才算有效
 volume_multiple_cap = 3                   # 成交量倍数上限
 oi_z_divisor = 3                          # 持仓量 Z 值除数
 weight_flow = 0.5                         # 成交分项权重
@@ -124,3 +126,14 @@ url = ""                                  # ntfy: https://ntfy.sh/你的主题  
 on_start = true
 daily_summary = true
 min_interval_s = 3600                     # 实现：同一类告警最短间隔
+
+[power]                                   # 运行在自己的 Mac 上：运行期间不让电脑睡眠
+prevent_sleep = true                      # macOS：运行期间挂一个 caffeinate（-i -m -s），进程退出就自动解除；其它系统忽略
+sleep_detect_s = 10                       # 实现：系统时钟比进程计时多走了这么多秒，就认定电脑睡眠过（这段时间的桶标为 sleep）
+check_interval_s = 60                     # 实现：多久检查一次供电方式（改用电池时推送）和 caffeinate 是否还在
+
+[heartbeat]                               # 每分钟向外部心跳服务报到；断电、断网、程序卡住时由心跳服务通知手机
+url = ""                                  # 留空 = 不报到。Healthchecks.io 填 https://hc-ping.com/<你的检查 UUID>
+interval_s = 60                           # 多久报到一次
+max_data_age_s = 120                      # 最近这么多秒内收到过完整的桶才报到；行情断了就不报到，让心跳服务报警
+timeout_s = 10                            # 报到请求超时

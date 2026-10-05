@@ -3,19 +3,25 @@
 接 OKX 公开行情，每 15 秒算一次力量分数，把数据和信号事件记下来。**不下单，不需要账户，也不读取任何接口密钥。**
 依据的是《资金流跟随策略 · 开发规格 v0.1》，下文「§n」指规格第 n 节。
 
+全部四个阶段都在你自己的 Mac 上运行，不用云服务器。**从零开始的操作步骤见 [docs/macos-setup.md](docs/macos-setup.md)**：
+装软件、拿代码、配置手机通知和心跳、试跑、装成后台服务、确认在正常录数据、一小时后自检、看日报，每一步都有可以直接复制的命令。
+
 ## 交付状态
 
 | 交付物（§14） | 状态 |
 | --- | --- |
 | 源代码 | `flowmon/`，按 数据接入 / 数据桶 / 分数 / 不交易条件 / 事件 / 存储 分模块 |
 | 配置文件样例 | `config.example.toml`，对应 §13，代码里没有任何默认值 |
-| 单元测试 | `tests/`，58 个单元测试 + 1 个端到端测试，全部通过 |
+| 单元测试 | `tests/`，93 个测试（含 2 个接本地假交易所的端到端测试），全部通过 |
 | 阶段一判定工具 | `python -m flowmon evaluate`，按已定口径判定 §11 阶段一是否通过，见「阶段一判定」 |
 | 说明文件 | 本文件 |
-| 至少 1 小时的实际运行记录 | 不单独做：直接部署到服务器开始正式记录，启动后第一个小时的日志和数据就是这份记录，步骤见「部署到服务器」。开发环境连不上 OKX，部署前用本地假交易所跑过 39.6 小时模拟时长的连续运行，见 [docs/sim-run.md](docs/sim-run.md) |
+| 至少 1 小时的实际运行记录 | 由你在自己的 Mac 上开始正式记录，启动一小时后运行 `flowmon check`，把自检结果、日志和当天的桶表发回来核对，步骤见 [docs/macos-setup.md](docs/macos-setup.md) 第 11 步。开发环境连不上 OKX，之前用本地假交易所跑过 39.6 小时模拟时长的连续运行，见 [docs/sim-run.md](docs/sim-run.md) |
+| 在自己的电脑上长期运行 | macOS 后台服务（登录后自动启动、崩溃后自动拉起）、运行期间阻止睡眠、重启后接着用存下的数据、停机期间的桶标为不完整、日报列出当天数据占用的磁盘、每分钟向心跳服务报到，见「在 Mac 上长期运行」 |
 | 对照官方文档核对 §4 | 官方文档站同样被拦截，只能通过搜索结果和二手资料核对。已核对和待核对的项见「与 OKX 官方文档的核对」 |
 
 ## 安装
+
+在 Mac 上正式运行按 [docs/macos-setup.md](docs/macos-setup.md) 做。下面是开发、跑测试用的最简步骤。
 
 需要 Python 3.11 或更高版本（配置用标准库 `tomllib` 读取）。运行时只依赖 `websockets`。
 
@@ -27,7 +33,7 @@ cp config.example.toml config.toml
 cp calendar.example.csv calendar.csv     # 经济数据日程，手工维护
 ```
 
-服务器必须开时间同步（例如 `chrony`）。数据延迟 = 本地接收时间 − 交易所时间戳，本机时钟偏了，延迟就不准。
+电脑要开自动对时（Mac：系统设置 → 通用 → 日期与时间 → 自动设置）。数据延迟 = 本地接收时间 − 交易所时间戳，本机时钟偏了，延迟就不准。
 
 ## 配置
 
@@ -40,7 +46,7 @@ cp calendar.example.csv calendar.csv     # 经济数据日程，手工维护
 | 数据桶宽度 | 15 秒 | `bucket.width_s` |
 | 成交方向窗口 | 4 个桶 | `score.flow_window_buckets` |
 | 持仓量变化窗口 | 20 个桶 | `score.oi_window_buckets` |
-| 基准值回看时长 | 24 小时 | `score.baseline_hours` |
+| 基准值回看时长 | 24 小时 | `score.baseline_hours`；凑这 24 小时有效数据最远往回找 `score.baseline_lookback_hours`（48 小时），见「重启后多久分数有效」 |
 | 成交量倍数上限 | 3 | `score.volume_multiple_cap` |
 | 持仓量 Z 值除数 | 3 | `score.oi_z_divisor` |
 | 两个分项的权重 | 各 0.5 | `score.weight_flow`、`score.weight_oi` |
@@ -61,7 +67,9 @@ cp calendar.example.csv calendar.csv     # 经济数据日程，手工维护
 
 §7 的仓位、时间止损、冷却，§8 的风控表和 §9 的手续费，阶段一不用，但已经放进配置（`[rules]` `[risk]` `[fees]`），阶段二直接读同一份文件。
 
-通知（§12）在 `[notify]` 里选渠道：`ntfy`（`url` 填 `https://ntfy.sh/你的主题`，手机装 ntfy 订阅同一主题）、`bark`（iOS，`url` 填 `https://api.day.app/你的key`）、`webhook`（POST JSON `{"title","body"}`）。用 `python -m flowmon notify --config config.toml 测试` 试发一条。会推送的情况：启动、停止、异常退出（systemd 钩子）、连续重连失败 5 次、磁盘剩余不足 2 GB、每日简报。
+通知（§12）在 `[notify]` 里选渠道：`ntfy`（`url` 填 `https://ntfy.sh/你的主题`，手机装 ntfy 订阅同一主题）、`bark`（iOS，`url` 填 `https://api.day.app/你的key`）、`webhook`（POST JSON `{"title","body"}`）。用 `python -m flowmon notify --config config.toml 测试` 试发一条。会推送的情况：启动、停止、上次没有正常停止（崩溃、强杀、断电、关机后重新启动时）、连续重连失败 5 次、磁盘剩余不足 2 GB、电脑睡眠过、改用电池供电和恢复接电源、caffeinate 意外退出、每日简报。
+
+`[power]` 管运行期间阻止睡眠和供电检查，`[heartbeat]` 管向外部心跳服务报到，见「在 Mac 上长期运行」。
 
 经济数据日程 `calendar.csv` 两列：`time_utc,name`，时间写 UTC，例如 `2026-10-15T12:30:00Z,美国 CPI`。运行中改了文件会自动重读。
 
@@ -72,48 +80,84 @@ python -m flowmon run --config config.toml                  # 一直运行，Ctr
 python -m flowmon run --config config.toml --duration 3600  # 跑 1 小时自动停
 ```
 
-长期运行用 systemd：把 `deploy/flowmon.service` 里的路径改成实际位置，放到 `/etc/systemd/system/`，然后
-`sudo systemctl enable --now flowmon`。崩溃后 5 秒自动拉起，并推送一条「异常退出」。
+同一个数据目录只允许一个监控器在写（`data/state/run.lock`）。后台服务在跑时再手动启动一个，会提示「另一个监控器正在写数据目录」并退出，不会把数据写乱。
 
-服务器地区：§12 要求选到 OKX 延迟最低的地区，实测后决定。可以在候选地区各跑 10 分钟，比较 `latency_ms` 列。
+**首次启动要先积累 24 小时数据，分数才有效**（§6）。这期间 `S` 照算，但 `score_valid=0`，不产生信号事件。
+重启后读回存下的桶数据，接着用停机前的数据当基准值，不用重新等 24 小时，见下面「重启后多久分数有效」。
 
-**启动后要先积累 24 小时数据，分数才有效**（§6）。这期间 `S` 照算，但 `score_valid=0`，不产生信号事件。
-重启时会读回最近 7 天的桶数据，恢复基准值和 7 天分位，不用重新等 24 小时（停机超过 24 小时除外）。
+## 在 Mac 上长期运行
 
-### 部署到服务器（正式开始记录）
+全部四个阶段都在自己的 Mac 上运行，不用云服务器。操作步骤见 [docs/macos-setup.md](docs/macos-setup.md)。这里说明实现。
 
-不单独跑「1 小时运行记录」：直接部署开始正式记录，启动后第一个小时的日志和数据就是 §14 要的运行记录，24 小时预热和之后 2–4 周的数据也同时开始积累。
+### 开机登录后自动启动、崩溃后自动拉起
 
-1. **选地区**：§12 要求选 OKX 延迟最低的地区。候选地区各开一台临时机器跑 10 分钟
-   `python -m flowmon run --config config.toml --duration 600`，再用 `python -m flowmon report --config config.toml --date <当天>` 看平均延迟。
-2. **机器**：Linux，Python 3.11 以上，磁盘留 20 GB 以上（原始数据估计每天 50–100 MB，4 周加日志约 3–4 GB）。
-3. **时间同步**：装 `chrony` 并确认 `timedatectl` 显示 `System clock synchronized: yes`。本机时钟不准，延迟和桶的归属都会受影响。
-4. **安装**：
-   ```bash
-   sudo useradd -r -m -d /opt/flowmon flowmon
-   sudo -u flowmon git clone <仓库地址> /opt/flowmon/src
-   sudo -u flowmon python3 -m venv /opt/flowmon/venv
-   sudo -u flowmon /opt/flowmon/venv/bin/pip install -r /opt/flowmon/src/monitor/requirements.txt
-   sudo -u flowmon cp /opt/flowmon/src/monitor/config.example.toml /opt/flowmon/config.toml
-   sudo -u flowmon cp /opt/flowmon/src/monitor/calendar.example.csv /opt/flowmon/calendar.csv
-   ```
-   下面的命令都在 `/opt/flowmon/src/monitor` 目录下、以 flowmon 用户执行，例如
-   `cd /opt/flowmon/src/monitor && sudo -u flowmon /opt/flowmon/venv/bin/python -m flowmon status --config /opt/flowmon/config.toml`；
-   用 root 试跑会让数据目录归 root 所有，之后 systemd 以 flowmon 身份启动时写不进去。
-   配置里的相对路径（`data`、`logs`、`calendar.csv`）都相对配置文件所在目录，也就是落在 `/opt/flowmon/` 下。改好 `[notify]`，用 `notify` 命令试发一条。
-5. **试跑 2 分钟**：`python -m flowmon run --config /opt/flowmon/config.toml --duration 120`，然后 `status` 看到 `完整=1` 的桶、日志里没有「解析 … 推送失败」，再继续。
-6. **常驻**：把 `deploy/flowmon.service` 里的路径对上（`WorkingDirectory=/opt/flowmon/src/monitor`），放到 `/etc/systemd/system/`，
-   `sudo systemctl enable --now flowmon`。崩溃后 5 秒自动拉起，并推送一条「异常退出」。
-7. **第一小时后**：留存 `python -m flowmon status --config /opt/flowmon/config.toml -n 240` 的输出和 `logs/flowmon.log`，这就是运行记录。
-   顺便对照下面「与 OKX 官方文档的核对」里标「待确认」的几项：日志里没有解析错误，说明字段名对得上；
-   `grep -c '"type":"oi"' data/raw/misc/<当天>.jsonl` 每小时约 1200 条，说明持仓量确实约 3 秒推一次。
-8. **24 小时后**：`score_valid` 开始为 1，信号事件开始写入；之后每天收到日报推送。
-9. **预热后满 2 周有效数据、筛选去重后满 300 条信号**：`python -m flowmon evaluate --config /opt/flowmon/config.toml --write`。
+```bash
+python -m flowmon service install --config ~/flowmon/config.toml   # 写服务定义并启动
+python -m flowmon service status  --config ~/flowmon/config.toml   # state、pid、启动过几次、上次退出码
+python -m flowmon service restart --config ~/flowmon/config.toml   # 更新代码后用：先正常停止再启动
+python -m flowmon service stop|start|uninstall --config ~/flowmon/config.toml
+python -m flowmon service print   --config ~/flowmon/config.toml   # 只打印服务定义，不安装（任何系统都能用）
+```
+
+服务定义写在 `~/Library/LaunchAgents/com.flowmon.monitor.plist`（launchd 用户级服务）：`RunAtLoad` 登录后自动启动，`KeepAlive` 不管因为什么退出都再拉起来（最快 10 秒一次），停止时先发 SIGTERM，监控器落盘、保存状态后退出，30 秒还没退才强杀。日志只写 `logs/flowmon.log`（`--no-console-log`），`logs/launchd.err.log` 只接启动失败、未捕获异常这类输出。
+
+- **必须有人登录过一次才会启动**。Mac 默认开着 FileVault（磁盘加密），开机后本来就要先输入密码解锁磁盘，系统级服务也一样要等，所以没用系统级服务（还需要管理员权限）。断电、自动更新重启后，在你登录之前监控器不会运行，心跳服务会通知你。
+- **上次没有正常停止的提醒**：启动时写一个运行标记 `data/state/running.json`，正常停止（包括出异常后有交代地停止）时删掉。下次启动时标记还在，说明上次是崩溃、被强杀、断电或关机，推送「已重新启动（上次没有正常停止）」。systemd 的失败钩子在 macOS 上没有对应物，所以改成程序自己判断。
+- 数据和代码放在 `~/flowmon`，不要放在「桌面」「文稿」「下载」：macOS 不允许后台服务读写这几个文件夹。
+
+### 运行期间阻止睡眠和休眠
+
+监控器启动时挂一个 `caffeinate -i -m -s -w <自己的 pid>`：`-i` 阻止空闲睡眠，`-m` 阻止磁盘空闲休眠，`-s` 阻止系统睡眠（只在接电源时有效）。`-w` 让它跟着监控器走，监控器一退出就自动解除，不改系统的电源设置。Mac 的休眠（把内存写到磁盘再断电）只在睡眠之后发生，挡住睡眠就挡住了休眠。每 `power.check_interval_s` 秒检查一次：caffeinate 意外退出就重新挂上；供电方式变了（拔电源、停电、恢复）就推送。
+
+合上笔记本盖子仍然会睡眠（外接显示器的合盖模式除外），这是 macOS 的硬性行为。万一睡眠了，监控器能发现：系统时钟比进程计时（睡眠时停住）多走了 `power.sleep_detect_s` 秒以上，就认定睡眠过。这时从睡前那一刻起、到重新连上拿到盘口快照为止的桶标为不完整（`sleep`），强制重连，推送「电脑睡眠过」。
+
+### 重启后多久分数有效
+
+基准值（§6 的「过去 24 小时平均成交量」和持仓量变化的标准差）用**最近 24 小时的有效数据**：最近 5760 个完整桶，最远往回找 `score.baseline_lookback_hours`（48 小时）。连续运行时这就是过去 24 小时；停机重启后可以接着用停机前的数据。基准值有效的条件不变：从第一个桶算起已经记录满 24 小时，且回看范围里的完整桶至少有 24 小时的 80%（`baseline_min_coverage`）。
+
+| 情况 | 分数什么时候有效 |
+| --- | --- |
+| 首次启动 | 满 24 小时后 |
+| 停机不超过 28.8 小时（48 − 24 × 80%） | 重启后约 6 分钟：只等持仓量变化窗口（5 分钟）和平滑窗口（1 分钟）重新填满 |
+| 停机超过 28.8 小时 | 停机前的数据不够了，要等新数据攒够 19.2 小时（24 × 80%） |
+
+`baseline_lookback_hours` 改成 24 就是严格的「过去 24 小时」：那样停机超过 4.8 小时，重启后要等约 19.2 小时（停机那段滑出 24 小时窗口到只剩 4.8 小时）。`flowmon check` 会按当前数据估算分数最早什么时候有效。
+
+### 停机期间的桶
+
+重启后第一个新桶封桶时，把上一个落盘的桶到它之间每一个桶补一行占位桶：标为不完整（`incomplete_reason=downtime`），价格、成交量都留空（不沿用停机前的收盘，免得事件的「之后 N 分钟价格」被填成旧价格），照常喂给分数、不交易条件和事件跟踪，并在 `raw/misc` 里记一条完整性记录，所以回放会生成同样的占位桶、结果和实时一致。停机超过 `storage.restore_days`（7 天）只补最近 7 天。停机跨过零点时，中间每一天的日报都会补写；日报里的「运行时长」不含停机，另列一行「停机」。
+
+### 日报里的磁盘占用
+
+日报多了两行：**当天数据占用磁盘**（逐笔成交、盘口快照、持仓量等原文、桶表、事件、日志分开列；按文件名里的日期统计，日志取按 UTC 零点切分出来的那一天的文件），以及数据目录合计和磁盘剩余。推送的一行摘要末尾也带上当天数据的大小。
+
+### 心跳报到
+
+配置 `heartbeat.url` 后，每 `interval_s`（60）秒用 GET 访问一次这个地址。**只有最近 `max_data_age_s`（120）秒内收到过完整的桶才报到**：进程还活着但行情断了，同样不报到，让心跳服务报警。报到失败只记日志，不影响录数据。推荐 Healthchecks.io（免费版就够）：周期 1 分钟、宽限 5 分钟，报警推到手机 ntfy 和邮箱，配置步骤见 [docs/macos-setup.md](docs/macos-setup.md) 第 6 步。地址里的 UUID 相当于密码，日志和自检输出只显示主机名。
+
+能报警的情况：断电、断网、电脑睡眠、监控器崩溃且没拉起来、监控器卡死、收不到行情超过约 7 分钟、登录前（重启后还没人登录）。
+
+### 自检
+
+```bash
+python -m flowmon check --config ~/flowmon/config.toml        # 默认看最近 60 分钟，--minutes 改
+```
+
+只读数据，不影响正在运行的监控器。逐项给出通过与否：监控器在运行（进程锁和后台服务状态）、最新的桶多久前结束、桶数和完整率、成交、盘口、持仓量推送频率、分数各项（F、M、A、Z、R、S）是否在计算以及预计何时有效、数据延迟、日志里的错误和警告、阻止睡眠是否生效（`pmset -g assertions`）、供电方式、睡眠记录、心跳最近一次成功；再附上不完整原因、分数无效原因、近处挂单没铺满的比例、各类原始推送条数、磁盘占用、最近 20 个桶。结果同时存到 `data/reports/check-<时间>.txt`。
+
+启动一小时后把这个文件、`logs/flowmon.log` 和当天的桶表发回来，用来确认真实数据在正常写入、分数在正常计算，顺便核对「与 OKX 官方文档的核对」里标「待确认」的几项（解析错误为 0 说明字段名对得上；持仓量推送约 3 秒一条）。
+
+### 正式记录的时间线
+
+1. **第一小时**：自检，发回结果。
+2. **24 小时后**：`score_valid` 开始为 1，信号事件开始写入；之后每天 UTC 00:30 收到日报推送。
+3. **预热后满 2 周有效数据、筛选去重后满 300 条信号**：`python -m flowmon evaluate --config ~/flowmon/config.toml --write`。
 
 ## 查看数据
 
 ```bash
 python -m flowmon status --config config.toml          # 最近 20 个桶、当天事件数、正在跟踪的事件
+python -m flowmon check  --config config.toml          # 自检，见上
 python -m flowmon report --config config.toml --date 2026-10-05   # 某天日报
 ```
 
@@ -128,8 +172,12 @@ python -m flowmon report --config config.toml --date 2026-10-05   # 某天日报
 | `data/raw/misc/YYYY-MM-DD.jsonl` | 持仓量、资金费率、强平原文，连接事件，每个桶的完整性记录 |
 | `data/meta/instrument.json` | 合约面值、精度（从公开接口读取，接口失败时用它兜底） |
 | `data/state/events.json` | 还没跟踪完的事件，重启后接着跟 |
+| `data/state/health.json` | 运行状况：进程、心跳最近一次成功和失败、阻止睡眠、供电、睡眠记录。每分钟更新，给 `check` 看 |
+| `data/state/running.json`、`run.lock` | 运行标记（判断上次是否正常停止）、进程锁 |
 | `data/reports/YYYY-MM-DD.md` | 每日简报，次日 00:30 UTC 后生成 |
-| `logs/flowmon.log` | 连接、重连、校验失败、异常；每个桶一行摘要。按天切分 |
+| `data/reports/check-*.txt` | 自检结果 |
+| `logs/flowmon.log` | 连接、重连、校验失败、异常；每个桶一行摘要。按 UTC 零点切分，旧的叫 `flowmon.log.YYYY-MM-DD` |
+| `logs/launchd.err.log`、`launchd.out.log` | 后台服务的标准输出：只有启动失败、未捕获异常这类内容 |
 
 估算磁盘占用：逐笔成交约 30–80 MB/天，盘口快照约 15–20 MB/天，桶表约 3 MB/天。
 
@@ -160,7 +208,7 @@ ret5 = (e.px_300s / e.price - 1) * e.direction * 100   # 信号后 5 分钟同�
 | `liq_long_vol`、`liq_short_vol` | 多头、空头被强平量（BTC），见下文强平频道的限制 |
 | `latency_ms` | 本地接收 − 交易所时间戳，桶内中位数 |
 | `late_trades` | 封桶后才到的成交条数，没计入任何桶（原始数据里有） |
-| `complete`、`incomplete_reason` | 是否完整；原因可多个，见「实现时补充的约定」第 4 条 |
+| `complete`、`incomplete_reason` | 是否完整；原因可多个，见「实现时补充的约定」第 4 条。`downtime` 是停机占位桶，这一行除时间外都为空 |
 | `F` `M` `A` `oi_chg` `Z` `B` `R_raw` `fix1` `fix2` `R` `price_chg` `S` | §6 各项。`R_raw` 是两条修正之前的原始分，`fix1`/`fix2` 为修正条件是否成立 |
 | `score_valid`、`score_note` | 分数是否有效；无效时写原因（`warmup`、`incomplete`、`flow_window_gap` 等） |
 | `range_pct`、`range_rank`、`range_hist_h` | 最近 30 分钟 (最高−最低)/收盘（%）、它在过去 7 天里的分位（0–100）、算分位用了多少小时的历史 |
@@ -267,7 +315,11 @@ python -m pytest -q tests
 - `test_evaluate.py`：§11 判定的收益口径（起算价用预计成交价）、5 分钟去重、自助区间可复现；通过、手续费不够、空头为负、4 段里 1 段为负（通过）和 2 段为负（不通过）、
   不交易条件下的信号被剔除但出现在参考行、筛选后不足 300 条；预热期和中间停机不计入 2 周、正好 14 天算够、数据不够。
 - `test_cli.py`：同一天表头变化另起 `D.1.csv` 后，`status` 仍显示真正最新的桶。
-- `test_end_to_end.py`：起一个加速 60 倍的假交易所，实时监控器中途重启一次，注入 seqId 断档、断线、停推，然后回放并逐桶比对，要求分数零差异。
+- `test_end_to_end.py`：起一个加速 60 倍的假交易所，实时监控器中途重启一次，注入 seqId 断档、断线、停推；停机那段补了占位桶、桶表连续；然后回放并逐桶比对，要求分数零差异。
+- `test_score.py` 另有：停机后重启接着用停机前的基准值（回看 48 小时时几分钟就有效、严格 24 小时时要等）；朴素实现按两种回看范围各比对一遍。
+- `test_local_run.py`：重启补占位桶（价格留空、misc 有记录、跨天补日报、最多补 7 天）；时钟跳变判为睡眠、标桶、强制重连，接假交易所确认醒来后重连并恢复完整；心跳只在有数据时报到、失败计数、地址打码；进程锁挡住第二个监控器；上次没正常停止时推送提醒、正常停止后删掉运行标记。
+- `test_macos.py`：launchd 服务定义的内容；安装、状态、重启、重装、停止、启动、卸载的命令顺序（launchctl 用假的）；虚拟环境里的 python 路径不被解析掉；caffeinate 的参数、意外退出后重新挂上；供电方式解析和推送。
+- `test_report_check.py`：日报的磁盘占用和停机时长；分数最早有效时刻的估算（首次启动、停机 3/10/28 小时、36 小时、严格 24 小时）；自检在模拟的第一小时数据上逐项给出预期结论、数据过期和心跳失败时报不通过、心跳地址不外泄。
 
 ## 与 OKX 官方文档的核对（§4、§14）
 
@@ -292,12 +344,12 @@ python -m pytest -q tests
 1. **桶的归属**：按交易所时间戳，左闭右开 `[起点, 起点+15 秒)`。水位线（收到的最大交易所时间戳）越过「桶结束 + 0.5 秒」才封桶，给晚到的推送留时间；完全没行情时按本地时钟兜底封桶。
 2. **桶结束时的盘口**：在第一条时间戳 ≥ 桶结束的盘口增量套用之前截图。
 3. **持仓量**：取时间戳早于桶结束的最后一条；距桶结束超过 30 秒，该桶标为不完整。
-4. **不完整的原因**：`startup`（启动到收到第一份盘口快照）、`disconnect`（断线到重连后收到快照）、`stale`（超过 5 秒没行情，主动重连）、`book_invalid`（seqId 断档、买一 ≥ 卖一、checksum 非 0 且对不上，到重新订阅后收到快照）、`oi_stale` / `oi_missing`、`no_book`、`no_price`。
+4. **不完整的原因**：`startup`（启动到收到第一份盘口快照）、`disconnect`（断线到重连后收到快照）、`stale`（超过 5 秒没行情，主动重连）、`book_invalid`（seqId 断档、买一 ≥ 卖一、checksum 非 0 且对不上，到重新订阅后收到快照）、`sleep`（电脑睡眠过，从睡前到重连后收到快照）、`downtime`（监控器没在运行：停机、崩溃、关机，重启后补写的占位桶）、`oi_stale` / `oi_missing`、`no_book`、`no_price`。
 5. **单位**：成交量、持仓量、挂单量、撤单量、强平量都换算成 BTC（张数 × `ctVal` × `ctMult`）；原始数据保留交易所原文。
 6. **M 的分母**：24 小时窗口里完整桶的总成交量 ÷ 这些桶覆盖的分钟数；「最近 1 分钟」就是成交方向窗口那 4 个桶。
 7. **Z 的标准差**：24 小时内每个桶的 5 分钟变化量（两端都完整才算），总体标准差，含当前桶。
 8. **最近 1 分钟价格变化**：当前桶收盘 − 4 个桶之前那个桶的收盘。变化为 0 不算「价格不配合」。
-9. **基准值有效**：历史铺满 24 小时，且其中完整桶至少占 80%（`baseline_min_coverage`）。
+9. **基准值**：最近 24 小时的有效数据，即回看 `baseline_lookback_hours`（48 小时）内最近 5760 个完整桶。**有效**：从第一个桶算起已经记录满 24 小时，且这些完整桶至少有 5760 × 80%（`baseline_min_coverage`）。见「重启后多久分数有效」。
 10. **窗口不跨缺口**：任何窗口里有缺桶或不完整桶，该桶分数无效。平滑要求 4 个 R 都有效。
 11. **信号穿越**：上一个桶分数有效且在门槛以内，本桶有效且到达门槛。上一个桶无效不算穿越（比如断线恢复后分数直接就在门槛外）。一次跨过多档时每档各记一条。
 12. **事件里的价格**：信号时价格 = 触发那个桶的最后一笔成交；之后各时点价格 = 对应时点所在桶的收盘。
@@ -308,7 +360,10 @@ python -m pytest -q tests
 17. **分数翻转**：对每个门槛 T，记住上一次 |S| > T 时的方向；这一次 |S| > T 且方向相反，就在这一刻记一次翻转。|S| ≤ T 的桶不改变记住的方向，分数无效的桶跳过。翻转次数 = 最近 30 分钟内记下的翻转个数；上一次超出发生在窗口之外也照样算，窗口只框翻转发生的时刻。恰好 ±T 不算超出。T = 0 就是规格原文：任何正负变化都算。
 18. **低波动**：30 分钟幅度 = (最高 − 最低) / 收盘，只用完整桶；历史不满 7 天时用已有的历史算分位，`range_hist_h` 记下用了多少小时。
 19. **不交易条件只记市场侧四条**。「连续 2 次亏损暂停」和风控表要看模拟成交的盈亏，阶段一没有仓位，留给阶段二回放判断（参数已在配置里）。
-20. **重启**：读回最近 7 天的桶恢复基准值、分位和翻转计数；没跟踪完的事件从状态文件接着跟。停机期间缺的桶会让这些事件 `followup_complete=0`；需要逐笔成交判定、还没判定的限价单窗口记为空。停机错过的日报重启时补写。
+20. **重启**：读回最近 7 天的桶恢复基准值、分位和翻转计数；没跟踪完的事件从状态文件接着跟。停机期间补写占位桶（`downtime`），会让这些事件 `followup_complete=0`、落在停机里的「之后 N 分钟价格」为空；需要逐笔成交判定、还没判定的限价单窗口记为空。停机错过的日报重启时补写。
+21. **睡眠检测**：系统时钟比进程计时多走了 `power.sleep_detect_s`（10）秒以上就认定睡眠过。进程计时用 `time.monotonic()`，macOS 和 Linux 上睡眠期间都不走。对时把系统时钟往前拨 10 秒以上也会被当成睡眠，结果只是多标几个不完整的桶、多重连一次。
+22. **心跳报到**：只在最近 `heartbeat.max_data_age_s` 秒内有完整的桶时报到，没数据时不报到也不主动报失败，交给心跳服务的宽限期判断，免得家里网络闪断一下就报警。
+23. **进程锁**：`data/state/run.lock` 上的 `flock`，进程退出（包括崩溃）时系统自动释放。
 
 ## 已定的口径
 
@@ -320,6 +375,13 @@ python -m pytest -q tests
 - **300 条**：按筛选、去重之后算，2 周和 300 条都满足才判定。
 - **结果稳定**：整段数据按时间等分 4 段，至少 3 段均值为正（不扣手续费）。
 - **对照组**：每小时 4 条。
+- **运行环境**：四个阶段都在自己的 Mac 上运行，不用云服务器；开机登录后自动启动、崩溃后自动拉起；运行期间阻止睡眠和休眠；重启后接着用存下的数据当基准值，停机期间的桶标为不完整；日报列出当天数据占用的磁盘；每分钟向外部心跳服务报到，断电断网时由心跳服务通知手机。
+- **重启后的基准值**：用最近 24 小时的有效数据，最远回看 48 小时（见「重启后多久分数有效」）。
+
+## 阶段四备忘（先记下，阶段四才用）
+
+1. **止损单随开仓单一起提交**，任何时刻不存在没有止损的仓位。OKX 下单接口可以在开仓单上附带止损（`attachAlgoOrds`），成交时止损随之生效。阶段四有加仓和减半，每次都要同步调整止损的数量，否则会出现一部分仓位没有止损；到时候写进测试。
+2. **接口密钥只开交易权限，不开提币权限**；家用网络的公网地址固定时才绑定地址。印象中 OKX 对有交易权限但没绑定地址的密钥，长时间（约 14 天）不用会自动删除，未核对官方说明，到阶段四时再确认。
 
 ## 还没定的
 

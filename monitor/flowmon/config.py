@@ -52,6 +52,7 @@ class ScoreCfg:
     flow_window_buckets: int
     oi_window_buckets: int
     baseline_hours: float
+    baseline_lookback_hours: float
     baseline_min_coverage: float
     volume_multiple_cap: float
     oi_z_divisor: float
@@ -164,6 +165,21 @@ class NotifyCfg:
 
 
 @dataclass(frozen=True)
+class PowerCfg:
+    prevent_sleep: bool
+    sleep_detect_s: float
+    check_interval_s: float
+
+
+@dataclass(frozen=True)
+class HeartbeatCfg:
+    url: str
+    interval_s: float
+    max_data_age_s: float
+    timeout_s: float
+
+
+@dataclass(frozen=True)
 class Config:
     exchange: ExchangeCfg
     connection: ConnectionCfg
@@ -178,6 +194,8 @@ class Config:
     storage: StorageCfg
     health: HealthCfg
     notify: NotifyCfg
+    power: PowerCfg
+    heartbeat: HeartbeatCfg
     base_dir: Path  # 配置文件所在目录，相对路径都从这里算
 
     def path(self, p: str) -> Path:
@@ -267,6 +285,10 @@ def _validate(c: Config) -> None:
     need(c.score.oi_window_buckets >= 1, "score.oi_window_buckets 至少 1")
     need(c.score.smooth_buckets >= 1, "score.smooth_buckets 至少 1")
     need(0 < c.score.baseline_min_coverage <= 1, "score.baseline_min_coverage 应在 (0, 1]")
+    need(c.score.baseline_lookback_hours >= c.score.baseline_hours,
+         "score.baseline_lookback_hours 不能小于 baseline_hours")
+    need(c.storage.restore_days * 24 >= c.score.baseline_lookback_hours,
+         "storage.restore_days 要覆盖 score.baseline_lookback_hours，重启时才读得回这么多数据")
     need(c.score.oi_z_divisor > 0, "score.oi_z_divisor 必须大于 0")
     need(c.score.baseline_hours * 3600 >= c.bucket.width_s * (c.score.oi_window_buckets + 2),
          "score.baseline_hours 太短，装不下持仓量变化窗口")
@@ -278,6 +300,14 @@ def _validate(c: Config) -> None:
     need(c.events.control_per_hour >= 0, "events.control_per_hour 不能为负")
     need(c.notify.kind in ("none", "ntfy", "bark", "webhook"), "notify.kind 只能是 none/ntfy/bark/webhook")
     need(c.notify.kind == "none" or c.notify.url, "notify.url 不能为空")
+    need(c.power.sleep_detect_s > 0, "power.sleep_detect_s 必须大于 0")
+    need(c.power.check_interval_s > 0, "power.check_interval_s 必须大于 0")
+    hb = c.heartbeat
+    need(hb.url == "" or hb.url.startswith(("https://", "http://")),
+         "heartbeat.url 留空（不报到）或以 https:// 开头")
+    need(hb.interval_s > 0 and hb.timeout_s > 0, "heartbeat.interval_s、timeout_s 必须大于 0")
+    need(hb.timeout_s < hb.interval_s, "heartbeat.timeout_s 必须小于 interval_s")
+    need(hb.max_data_age_s >= c.bucket.width_s * 2, "heartbeat.max_data_age_s 至少两个桶宽")
     need(len(set(c.events.tiers)) == len(c.events.tiers) and all(t > 0 for t in c.events.tiers),
          "events.tiers 必须是不重复的正数")
     need(c.rules.entry_threshold in c.events.tiers, "events.tiers 必须包含进场门槛 rules.entry_threshold")

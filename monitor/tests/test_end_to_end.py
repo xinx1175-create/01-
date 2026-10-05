@@ -1,4 +1,4 @@
-"""端到端：假交易所（加速 60 倍）→ 实时监控器（中途重启一次）→ 回放 → 与实时逐桶比对。
+"""端到端：假交易所（加速 60 倍）→ 实时监控器（中途重启一次，停机那段补占位桶）→ 回放 → 与实时逐桶比对。
 
 注入三种故障：盘口 seqId 断档、服务端断线、停推。约 35 秒。
 """
@@ -59,6 +59,11 @@ def test_live_restart_replay_consistency(tmp_path):
             rows += list(csv.DictReader(p.open()))
     starts = [int(r["start_ms"]) for r in rows]
     assert starts == sorted(set(starts)), "桶不能重复、不能乱序"
+    w = cfg.bucket.width_s * 1000
+    assert all(b - a == w for a, b in zip(starts, starts[1:])), "停机那段也要有占位桶，桶表连续"
+    down = [r for r in rows if r["incomplete_reason"] == "downtime"]
+    assert len(down) >= 2, "停机 1 秒 = 模拟 1 分钟，至少 2 个占位桶"
+    assert all(r["complete"] == "0" and r["close"] == "" and r["score_valid"] == "0" for r in down)
     reasons = "|".join(r["incomplete_reason"] for r in rows)
     for k in ("startup", "book_invalid", "disconnect", "stale"):
         assert k in reasons, k
@@ -70,7 +75,7 @@ def test_live_restart_replay_consistency(tmp_path):
 
     out = tmp_path / "replay"
     stats = Replayer(cfg, data, out).run(days[0], days[-1])
-    assert stats["skipped"] >= 1  # 两次运行之间的空档
+    assert stats["skipped"] == 0  # 两次运行之间的空档有占位桶，回放也生成同样的占位桶
     cmp = compare(cfg, data, out, days)
     assert cmp["buckets_common"] == len(rows)
     assert cmp["score_mismatch"] == 0, cmp

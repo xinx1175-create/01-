@@ -86,10 +86,15 @@ class Feed:
         self.healthy = False
         self.fail_streak = 0
         self.last_data = 0.0
+        self.reconnect_reason: str | None = None
 
     def mark_healthy(self) -> None:
         """收到盘口快照后由上层调用：这次连接算成功。"""
         self.healthy = True
+
+    def request_reconnect(self, reason: str) -> None:
+        """要求断开当前连接重连（例如电脑睡眠醒来后，本地盘口已经不可信，要重新拿快照）。"""
+        self.reconnect_reason = reason
 
     async def resubscribe_books(self) -> None:
         if self.ws is None:
@@ -138,6 +143,7 @@ class Feed:
         async with websockets.connect(url, ping_interval=None, max_size=None,
                                       open_timeout=c.subscribe_timeout_s, close_timeout=2) as ws:
             self.ws = ws
+            self.reconnect_reason = None  # 新连接本来就会重新拿快照
             await ws.send(json.dumps({"op": "subscribe", "args": self.args}))
             log.info("已连接 %s，发送订阅", url)
             self.h.on_open()
@@ -171,4 +177,7 @@ class Feed:
                     return "stale"
                 if not self.healthy and now - t0 > c.subscribe_timeout_s:
                     return "no_snapshot"
+                if self.reconnect_reason is not None:
+                    reason, self.reconnect_reason = self.reconnect_reason, None
+                    return reason
             return "stopped"

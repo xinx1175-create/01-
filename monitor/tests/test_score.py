@@ -133,11 +133,32 @@ def test_rejects_out_of_order(scfg):
         eng.update(bucket(5, 1, 1, 100, 1000))
 
 
+def test_restart_after_outage_reuses_saved_baseline(cfg_factory):
+    """停机后重启：回看范围里停机前的完整桶还够，就接着用，几个桶之后分数就有效；
+    回看范围等于基准时长（严格的「过去 24 小时」）时要等完整桶重新攒够 80%。"""
+    def run(look_buckets):
+        c = cfg_factory(score={"baseline_hours": BASE_H, "baseline_lookback_hours": look_buckets * 15 / 3600}).score
+        rows = _flat(60)
+        # 停机 20 个桶（基准窗口的一半），重启时补的占位桶：不完整、没有数据
+        rows += [{"start_ms": i * W, "complete": False, "buy_vol": None, "sell_vol": None, "close": None,
+                  "oi": None} for i in range(60, 80)]
+        rows += [bucket(i, 1, 1, 100, 1000 + (i % 3) * 5) for i in range(80, 140)]
+        res = score_series(rows, c, 15)
+        return next(i for i in range(80, 140) if res[i].valid)
+
+    # 回看 80 个桶：80 号桶时回看范围里有 60 个完整桶 ≥ 32，基准有效；
+    # 等持仓量窗口（20 个桶）和平滑窗口（4 个）重新填满，103 号桶分数有效
+    assert run(80) == 80 + 20 + 3
+    # 严格 40 个桶：基准窗口里要重新攒够 32 个完整桶（停机前的 20 个 + 重启后 12 个），还要再等平滑窗口
+    assert run(40) > 80 + 20 + 3
+
+
 # ---------- 朴素实现：逐字照第 6 节，每个桶都把窗口从头扫一遍 ----------
 
 def naive(rows, c, width_s):
     w = width_s * 1000
     n = round(c.baseline_hours * 3600 / width_s)
+    look = max(n, round(c.baseline_lookback_hours * 3600 / width_s))  # 基准值最远回看多少个桶
     by = {r["start_ms"]: r for r in rows}
     out = []
     R = {}
@@ -149,10 +170,10 @@ def naive(rows, c, width_s):
     for r in rows:
         s = r["start_ms"]
         res = {}
-        lo = s - n * w
-        win = [x for x in rows if lo < x["start_ms"] <= s]
-        comp = [x for x in win if x["complete"]]
-        span = win and win[0]["start_ms"] <= s - (n - 1) * w
+        lo_look = s - look * w
+        # 基准值：回看范围内最近 n 个完整桶；历史（从第一个桶算起）要铺满 n 个桶
+        comp = [x for x in rows if lo_look < x["start_ms"] <= s and x["complete"]][-n:]
+        span = rows[0]["start_ms"] <= s - (n - 1) * w
         ready = bool(span) and len(comp) >= c.baseline_min_coverage * n
         fw = [s - k * w for k in range(c.flow_window_buckets)]
         F = M = A = Z = B = Rv = None
@@ -169,7 +190,7 @@ def naive(rows, c, width_s):
         if r["complete"] and ok(t0):
             d = r["oi"] - by[t0]["oi"]
             doi_hist.append((s, d))
-            vals = [v for t, v in doi_hist if lo < t <= s]
+            vals = [v for t, v in doi_hist if lo_look < t <= s][-n:]
             if len(vals) >= 2:
                 m = sum(vals) / len(vals)
                 sd = math.sqrt(sum((v - m) ** 2 for v in vals) / len(vals))
@@ -197,8 +218,11 @@ def naive(rows, c, width_s):
     return out
 
 
+@pytest.mark.parametrize("look", [1, 3])
 @pytest.mark.parametrize("seed", [1, 2, 3])
-def test_matches_naive_reference(scfg, seed):
+def test_matches_naive_reference(cfg_factory, seed, look):
+    # look=1：回看范围等于基准时长（严格的「过去 N 小时」）；look=3：回看 3 倍，缺口后接着用更早的完整桶
+    scfg = cfg_factory(score={"baseline_hours": BASE_H, "baseline_lookback_hours": BASE_H * look}).score
     rng = random.Random(seed)
     rows, oi, px = [], 10_000.0, 100.0
     i = 0
@@ -206,6 +230,8 @@ def test_matches_naive_reference(scfg, seed):
         i += 1
         if rng.random() < 0.03:
             continue  # 偶尔缺桶
+        if 180 < i < 200:
+            continue  # 一段长停机：比基准窗口的 20% 还长
         oi += rng.gauss(0, 20) + (30 if 120 < i < 140 else 0)
         px += rng.gauss(0, 0.3)
         rows.append(bucket(i, rng.random() * 5, rng.random() * 5, px, oi, rng.random() > 0.05))

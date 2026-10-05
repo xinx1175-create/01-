@@ -13,15 +13,16 @@ from pathlib import Path
 from . import config as config_mod
 
 
-def setup_logging(cfg: config_mod.Config | None, name: str) -> None:
+def setup_logging(cfg: config_mod.Config | None, name: str, console: bool = True) -> None:
     fmt = logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
     fmt.converter = __import__("time").gmtime  # 日志时间统一 UTC
     root = logging.getLogger()
     root.setLevel(logging.INFO)
     root.handlers.clear()
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(fmt)
-    root.addHandler(sh)
+    if console:
+        sh = logging.StreamHandler(sys.stdout)
+        sh.setFormatter(fmt)
+        root.addHandler(sh)
     if cfg is not None:
         cfg.log_dir.mkdir(parents=True, exist_ok=True)
         fh = logging.handlers.TimedRotatingFileHandler(cfg.log_dir / f"{name}.log", when="midnight",
@@ -33,15 +34,22 @@ def setup_logging(cfg: config_mod.Config | None, name: str) -> None:
 
 
 def cmd_run(a) -> int:
-    from .monitor import Monitor
+    from .monitor import AlreadyRunning, Monitor
     from .okx import load_instrument
 
     cfg = config_mod.load(a.config)
-    setup_logging(cfg, "flowmon")
+    # 后台服务（launchd）下不往标准输出写日志，免得 launchd 的输出文件和 logs/flowmon.log 重复、无限变大
+    setup_logging(cfg, "flowmon", console=not a.no_console_log)
     log = logging.getLogger("flowmon")
     log.info("启动：%s，数据目录 %s", cfg.exchange.inst_id, cfg.data_dir)
     inst = load_instrument(cfg)
     m = Monitor(cfg, inst)
+    try:
+        m.lock()
+    except AlreadyRunning as e:
+        log.error("%s", e)
+        print(f"没有启动：{e}", file=sys.stderr)
+        return 3
     m.restore()
     asyncio.run(m.run(a.duration))
     return 0
@@ -131,6 +139,43 @@ def cmd_status(a) -> int:
     return 0
 
 
+def cmd_check(a) -> int:
+    from .selfcheck import run_check
+
+    cfg = config_mod.load(a.config)
+    text, ok = run_check(cfg, a.minutes)
+    print(text)
+    return 0 if ok else 1
+
+
+def cmd_service(a) -> int:
+    from . import macos, power
+
+    cfg = config_mod.load(a.config)
+    if a.action == "print":
+        sys.stdout.write(macos.render_plist(macos.venv_python(), Path(a.config).resolve(), macos.package_dir(),
+                                            cfg.log_dir).decode())
+        return 0
+    if not power.is_macos():
+        print("后台服务只支持 macOS（launchd）。用 service print 可以看服务定义。", file=sys.stderr)
+        return 2
+    try:
+        if a.action == "install":
+            msgs = macos.install(Path(a.config), cfg.log_dir)
+        elif a.action == "status":
+            st = macos.status()
+            msgs = ([f"{k}：{v}" for k, v in st.items() if k != "loaded"] if st["loaded"]
+                    else ["服务没有加载（没安装，或者已经 stop）"])
+            msgs.append(f"服务定义 {macos.plist_path()}（{'存在' if macos.plist_path().exists() else '不存在'}）")
+        else:
+            msgs = getattr(macos, a.action)()
+    except RuntimeError as e:
+        print(f"失败：{e}", file=sys.stderr)
+        return 1
+    print("\n".join(msgs))
+    return 0
+
+
 def cmd_notify(a) -> int:
     from .notify import Notifier
 
@@ -172,6 +217,7 @@ def main(argv=None) -> int:
     r = sub.add_parser("run", help="启动监控器")
     r.add_argument("--config", required=True)
     r.add_argument("--duration", type=float, default=None, help="运行多少秒后自动停（默认一直运行）")
+    r.add_argument("--no-console-log", action="store_true", help="日志只写文件，不打印到屏幕（后台服务用）")
     r.set_defaults(fn=cmd_run)
 
     r = sub.add_parser("replay", help="从原始数据重新生成桶和信号事件")
@@ -202,7 +248,17 @@ def main(argv=None) -> int:
     r.add_argument("-n", type=int, default=20)
     r.set_defaults(fn=cmd_status)
 
-    r = sub.add_parser("notify", help="发一条测试通知（也给 systemd 的失败钩子用）")
+    r = sub.add_parser("check", help="自检：确认在正常录数据、分数在正常计算，结果同时存到 data/reports/")
+    r.add_argument("--config", required=True)
+    r.add_argument("--minutes", type=float, default=60, help="检查最近多少分钟，默认 60")
+    r.set_defaults(fn=cmd_check)
+
+    r = sub.add_parser("service", help="macOS 后台服务：登录后自动启动、崩溃后自动拉起")
+    r.add_argument("action", choices=["install", "start", "stop", "restart", "status", "uninstall", "print"])
+    r.add_argument("--config", required=True)
+    r.set_defaults(fn=cmd_service)
+
+    r = sub.add_parser("notify", help="发一条测试通知")
     r.add_argument("--config", required=True)
     r.add_argument("title")
     r.add_argument("body", nargs="?", default="")

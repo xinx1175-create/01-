@@ -202,6 +202,21 @@ class Bucket:
         }
 
 
+DOWNTIME = "downtime"
+
+
+def downtime_row(start_ms: int, width_ms: int) -> dict:
+    """监控器没在运行（停机、崩溃、电脑关机）那段时间的占位桶：标为不完整，没有价格也没有成交量。
+
+    价格留空而不沿用停机前的收盘，免得事件的「之后 N 分钟价格」被填成停机前的旧价格。
+    """
+    row = Bucket(start_ms, width_ms, reasons={DOWNTIME}).finish(None, None, None, 1.0, 0, judge=False)
+    for k in ("buy_vol", "sell_vol", "trade_count", "trade_msgs", "liq_long_vol", "liq_short_vol",
+              "late_trades"):
+        row[k] = None
+    return row
+
+
 class Aggregator:
     """实时聚合：按交易所时间开桶，水位线越过 桶结束 + 宽限 才封桶。"""
 
