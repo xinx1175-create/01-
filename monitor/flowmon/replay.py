@@ -24,7 +24,7 @@ from .conditions import Calendar, Conditions
 from .config import Config
 from .events import EventEngine, public
 from .okx import contract_size
-from .schema import BUCKET_COLUMNS, event_columns
+from .schema import bucket_columns, event_columns
 from .score import ScoreEngine
 from .storage import DailyCsv, day_files, load_json, read_csv, read_jsonl
 
@@ -93,7 +93,7 @@ class Replayer:
         cond = Conditions(c, cfg.bucket.width_s, cal)
         events = EventEngine(cfg, self.ct)
         ev_cols = [n for n, _ in event_columns(cfg)]
-        w_b = DailyCsv(self.out / "buckets", [n for n, _ in BUCKET_COLUMNS])
+        w_b = DailyCsv(self.out / "buckets", [n for n, _ in bucket_columns(cfg)])
         w_e = DailyCsv(self.out / "events", ev_cols)
         stats = {"buckets": 0, "skipped": 0, "events": 0, "trades": 0}
         prev_close = None
@@ -197,7 +197,7 @@ class Replayer:
 
 def compare(cfg: Config, live_data: Path, replay_out: Path, days: list[str]) -> dict:
     """逐桶比对实时与回放的分数、逐条比对事件，返回差异统计。桶宽不同时没有意义。"""
-    bt = dict(BUCKET_COLUMNS)
+    bt = dict(bucket_columns(cfg))
     live = {r["start_ms"]: r for r in read_csv(day_files(live_data / "buckets", days, ".csv"), bt)}
     rep = {r["start_ms"]: r for r in read_csv(day_files(replay_out / "buckets", days, ".csv"), bt)}
     common = sorted(set(live) & set(rep))

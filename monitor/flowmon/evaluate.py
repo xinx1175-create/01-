@@ -1,24 +1,26 @@
 """阶段一通过标准（§11）的判定。
 
 口径在看到结果之前定死，写在配置 [evaluation] 里，事后不改：
-- 信号组：进场门槛那一档（rules.entry_threshold）的信号事件；对照组：每小时随机时刻、随机方向（种子固定）
+- 信号组：进场门槛那一档（rules.entry_threshold）的信号事件，处于 §8 不交易条件的不算（exclude_no_trade）；
+  对照组：每小时等分几段各抽一个随机时刻、随机方向（种子固定）
 - 收益：horizon_s 秒后的同向涨跌幅，起算价用市价单的预计成交价（mkt_fill_px），不用中间价
-- 相邻信号间隔不足 dedupe_minutes 的，只保留前一条（和上一条保留下来的比）
+- 先筛掉不交易条件下的信号，再去重：相邻信号间隔不足 dedupe_minutes 的只保留前一条（和上一条保留下来的比）
+- 最低数据量（min_signals 条、min_weeks 周）按筛选、去重之后的条数算，两个都满足才判定
 - 三条同时满足才算通过：
   1. 信号组均值 − 对照组均值，自助抽样 bootstrap_reps 次的置信区间下限 > 0
   2. 信号组均值 ≥ 来回手续费（进出都按吃单）；进场吃单、离场挂单的结果另列一行，只作参考
-  3. 做多、做空分开算均值都为正；按周（UTC，周一起）拆开，至少 weekly_positive_share 的周均值为正
+  3. 做多、做空分开算均值都为正；整段数据按时间等分成 segments 段，至少 segments_positive_min 段均值为正
 - horizon_s 是唯一判定口径，其它时长照常报告，不参与判定
 """
 from __future__ import annotations
 
 import random
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 
+from .bucket import iso_utc
 from .config import Config
-from .schema import BUCKET_COLUMNS, event_columns
+from .schema import bucket_columns, event_columns
 from .storage import day_files, read_csv
 
 
@@ -66,11 +68,6 @@ def bootstrap_diff_ci(sig: list[float], ctrl: list[float], reps: int, conf: floa
     return quantile(diffs, a), quantile(diffs, 1 - a)
 
 
-def iso_week(ms: int) -> str:
-    y, w, _ = datetime.fromtimestamp(ms / 1000, tz=timezone.utc).isocalendar()
-    return f"{y}-W{w:02d}"
-
-
 @dataclass
 class Check:
     name: str
@@ -91,16 +88,16 @@ def evaluate(cfg: Config, data: Path, days: list[str] | None = None) -> tuple[st
     if days is None:
         days = sorted({p.name[:10] for d in (ev_dir, b_dir) for p in d.glob("*.csv")})
     events = list(read_csv(day_files(ev_dir, days, ".csv"), dict(event_columns(cfg))))
-    buckets = list(read_csv(day_files(b_dir, days, ".csv"), dict(BUCKET_COLUMNS)))
+    buckets = list(read_csv(day_files(b_dir, days, ".csv"), dict(bucket_columns(cfg))))
 
     tier = cfg.rules.entry_threshold
-    sig_all = [e for e in events if e["kind"] == "signal" and e["tier"] == tier]
+    gap = int(ev_cfg.dedupe_minutes * 60_000)
+    sig_tier = [e for e in events if e["kind"] == "signal" and e["tier"] == tier]
     ctrl_all = [e for e in events if e["kind"] == "control"]
-    n_nt = 0
-    if ev_cfg.exclude_no_trade:
-        n_nt = sum(1 for e in sig_all if e["no_trade"])
-        sig_all = [e for e in sig_all if not e["no_trade"]]
-    sig_d = dedupe(sig_all, int(ev_cfg.dedupe_minutes * 60_000))
+    nt_sig = [e for e in sig_tier if e["no_trade"]]
+    # 先筛掉不交易条件下的信号，再去重
+    pool = [e for e in sig_tier if not e["no_trade"]] if ev_cfg.exclude_no_trade else sig_tier
+    sig_d = dedupe(pool, gap)
 
     def usable(es):
         return [e for e in es if same_dir_return(e, h) is not None]
@@ -109,10 +106,15 @@ def evaluate(cfg: Config, data: Path, days: list[str] | None = None) -> tuple[st
     rs = [same_dir_return(e, h) for e in sig]
     rc = [same_dir_return(e, h) for e in ctrl]
 
+    t0 = t1 = None
     span_days = 0.0
     if buckets:
         starts = [b["start_ms"] for b in buckets]
         span_days = (max(starts) - min(starts)) / 86_400_000
+        # 分段用的「整段数据」从第一个有效分数开始：预热期不可能有信号，算进去会让第一段系统性偏少
+        valid = [b["start_ms"] for b in buckets if b["score_valid"]]
+        if valid:
+            t0, t1 = min(valid), max(starts) + cfg.bucket.width_s * 1000
     enough = len(rs) >= ev_cfg.min_signals and span_days >= ev_cfg.min_weeks * 7 and len(rc) >= 2
 
     fee_rt = 2 * fees.taker_rate * 100
@@ -133,20 +135,23 @@ def evaluate(cfg: Config, data: Path, days: list[str] | None = None) -> tuple[st
     checks.append(Check("2 够付手续费", f"信号均值 ≥ {fee_rt:.2f}%（进出都按吃单）", _pct(ms),
                         None if ms is None else ms >= fee_rt))
 
-    # 3. 结果稳定：多空分开 + 按周
+    # 3. 结果稳定：多空分开 + 按时间等分
     longs = [r for r, e in zip(rs, sig) if e["direction"] > 0]
     shorts = [r for r, e in zip(rs, sig) if e["direction"] < 0]
     ml, msh = mean(longs), mean(shorts)
     checks.append(Check("3a 多空分开", "做多、做空均值都 > 0",
                         f"多 {_pct(ml)}（{len(longs)} 条），空 {_pct(msh)}（{len(shorts)} 条）",
                         None if ml is None or msh is None else (ml > 0 and msh > 0)))
-    weeks: dict[str, list[float]] = {}
-    for r, e in zip(rs, sig):
-        weeks.setdefault(iso_week(e["ts_ms"]), []).append(r)
-    pos = sum(1 for v in weeks.values() if mean(v) > 0)
-    share = pos / len(weeks) if weeks else None
-    checks.append(Check("3b 按周拆开", f"至少 {ev_cfg.weekly_positive_share:.0%} 的周均值 > 0",
-                        f"{pos} / {len(weeks)} 周为正", None if share is None else share >= ev_cfg.weekly_positive_share))
+    n_seg = ev_cfg.segments
+    segs: list[list[float]] = [[] for _ in range(n_seg)]
+    if t0 is not None and t1 > t0:
+        for r, e in zip(rs, sig):
+            k = (e["ts_ms"] - t0) * n_seg // (t1 - t0)
+            segs[min(max(k, 0), n_seg - 1)].append(r)
+    # 没有信号的段算不上「为正」
+    pos = sum(1 for v in segs if v and mean(v) > 0)
+    checks.append(Check("3b 按时间等分", f"整段数据等分 {n_seg} 段，至少 {ev_cfg.segments_positive_min} 段均值 > 0",
+                        f"{pos} / {n_seg} 段为正", None if not rs else pos >= ev_cfg.segments_positive_min))
 
     if not enough:
         verdict = None
@@ -158,18 +163,19 @@ def evaluate(cfg: Config, data: Path, days: list[str] | None = None) -> tuple[st
     def yn(ok):
         return "—" if ok is None else ("通过" if ok else "不通过")
 
+    filt = "，不交易条件下的不进判定" if ev_cfg.exclude_no_trade else ""
     lines = [
         f"# 阶段一判定（§11）：{days[0] if days else '-'} → {days[-1] if days else '-'}",
         "",
-        f"判定口径：信号后 {h} 秒的同向涨跌幅，起算价为市价单预计成交价；信号取 {tier:g} 档，"
+        f"判定口径：信号后 {h} 秒的同向涨跌幅，起算价为市价单预计成交价；信号取 {tier:g} 档{filt}，"
         f"相邻不足 {ev_cfg.dedupe_minutes:g} 分钟只留前一条。",
         "",
         "| 数据 | 数量 |",
         "| --- | --- |",
         f"| 覆盖天数 | {span_days:.1f} 天（要求 ≥ {ev_cfg.min_weeks * 7:g} 天） |",
-        f"| {tier:g} 档信号 | {len(sig_all) + n_nt} 条"
-        + (f"，其中不交易条件下 {n_nt} 条已剔除" if ev_cfg.exclude_no_trade else "") + " |",
-        f"| 去重后 | {len(sig_d)} 条，缺 {h} 秒价格或预计成交价的 {len(sig_d) - len(sig)} 条不计 |",
+        f"| {tier:g} 档信号 | {len(sig_tier)} 条，其中处于不交易条件 {len(nt_sig)} 条"
+        + ("（不进判定）" if ev_cfg.exclude_no_trade else "（照常计入）") + " |",
+        f"| 筛选、去重后 | {len(sig_d)} 条，缺 {h} 秒价格或预计成交价的 {len(sig_d) - len(sig)} 条不计 |",
         f"| 参与判定的信号 | {len(rs)} 条（要求 ≥ {ev_cfg.min_signals}） |",
         f"| 参与判定的对照组 | {len(rc)} 条 |",
         f"| 信号组均值 | {_pct(ms)} |",
@@ -185,10 +191,34 @@ def evaluate(cfg: Config, data: Path, days: list[str] | None = None) -> tuple[st
     lines += [
         f"| **结论** | 三条同时满足 | {concl} | |",
         "",
-        "参考（不参与判定）：",
+        "## 参考（不参与判定）",
         "",
-        f"- 进场吃单、离场挂单的来回手续费 {fee_ref:.2f}%：信号均值"
-        f"{'不低于' if ms is not None and ms >= fee_ref else '低于'}它（{_pct(ms)}）",
+        f"进场吃单、离场挂单的来回手续费 {fee_ref:.2f}%：信号均值"
+        f"{'不低于' if ms is not None and ms >= fee_ref else '低于'}它（{_pct(ms)}）。",
+        "",
+        f"不交易条件的过滤作用（各组各自去重，{h} 秒同向涨跌幅）：",
+        "",
+        "| 组 | 条数 | 均值 | 与对照组的差 |",
+        "| --- | --- | --- | --- |",
+    ]
+
+    def group_row(name: str, es: list[dict]) -> str:
+        r = [same_dir_return(e, h) for e in dedupe(es, gap)]
+        r = [x for x in r if x is not None]
+        m = mean(r)
+        diff = None if m is None or mc is None else m - mc
+        return f"| {name} | {len(r)} | {_pct(m)} | {_pct(diff)} |"
+
+    judged = "参与判定（不交易条件之外）" if ev_cfg.exclude_no_trade else "参与判定（全部信号）"
+    lines.append(group_row(judged, pool))
+    lines.append(group_row(f"全部 {tier:g} 档信号", sig_tier))
+    lines.append(group_row("处于不交易条件的", nt_sig))
+    for key, label in (("low_vol", "低波动"), ("flips", "分数翻转"), ("calendar", "经济数据"), ("data", "数据不完整")):
+        grp = [e for e in nt_sig if any(x.split(":")[0] == key for x in (e["no_trade_reason"] or "").split("|"))]
+        if grp:
+            lines.append(group_row(f"　其中 {label}", grp))
+
+    lines += [
         "",
         "其它时长（只报告，不能事后换成判定口径）：",
         "",
@@ -204,7 +234,11 @@ def evaluate(cfg: Config, data: Path, days: list[str] | None = None) -> tuple[st
         diff = None if ma is None or mb is None else ma - mb
         mark = "（判定口径）" if hz == h else ""
         lines.append(f"| {hz} 秒{mark} | {len(a)} | {_pct(ma)} | {len(b)} | {_pct(mb)} | {_pct(diff)} |")
-    if weeks:
-        lines += ["", "按周：", "", "| 周 | 信号条数 | 均值 |", "| --- | --- | --- |"]
-        lines += [f"| {w} | {len(v)} | {_pct(mean(v))} |" for w, v in sorted(weeks.items())]
+    if t0 is not None and t1 > t0:
+        lines += ["", f"按时间等分 {n_seg} 段（从第一个有效分数 {iso_utc(t0)[:16]} 起）：", "", "| 段 | 时间（UTC） | 信号条数 | 均值 |", "| --- | --- | --- | --- |"]
+        for k, v in enumerate(segs):
+            a = t0 + (t1 - t0) * k // n_seg
+            b = t0 + (t1 - t0) * (k + 1) // n_seg
+            lines.append(f"| {k + 1} | {iso_utc(a)[:16]} → {iso_utc(b)[:16]} | {len(v)} | "
+                         f"{_pct(mean(v)) if v else '无信号'} |")
     return "\n".join(lines) + "\n", verdict

@@ -99,7 +99,7 @@ def cmd_evaluate(a) -> int:
 
 
 def cmd_status(a) -> int:
-    from .schema import BUCKET_COLUMNS
+    from .schema import bucket_columns
     from .storage import load_json, read_csv
 
     cfg = config_mod.load(a.config)
@@ -107,7 +107,7 @@ def cmd_status(a) -> int:
     if not files:
         print("还没有任何桶数据")
         return 1
-    rows = list(read_csv([files[-1]], dict(BUCKET_COLUMNS)))
+    rows = list(read_csv([files[-1]], dict(bucket_columns(cfg))))
     last = rows[-a.n:]
     print(f"{'时间(UTC)':24} {'完整':4} {'收盘':>10} {'买量':>8} {'卖量':>8} {'F':>6} {'M':>5} {'Z':>6} {'S':>7} 有效 不交易")
     for r in last:

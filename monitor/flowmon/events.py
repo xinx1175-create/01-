@@ -128,11 +128,13 @@ class EventEngine:
         s = row["start_ms"]
         hour = s - s % HOUR_MS
         if hour != self.ctrl_hour:
+            # 一小时等分成 n 段，每段随机抽一个桶、随机一个方向，免得几条挤在一起。
             # 种子含小时起点：同一份数据回放时抽到同一批时刻
             rng = random.Random(f"{self.ev.control_seed}:{hour}")
             per_hour = HOUR_MS // self.w
-            slots = sorted(rng.sample(range(per_hour), min(n, per_hour)))
-            self.ctrl_slots = [(i, rng.choice((1, -1))) for i in slots]
+            n = min(n, per_hour)
+            self.ctrl_slots = [(rng.randrange(k * per_hour // n, (k + 1) * per_hour // n), rng.choice((1, -1)))
+                               for k in range(n)]
             self.ctrl_hour = hour
             self.ctrl_done = 0
         if self.ctrl_done >= len(self.ctrl_slots):
@@ -140,7 +142,7 @@ class EventEngine:
         idx, d = self.ctrl_slots[self.ctrl_done]
         if (s - hour) // self.w < idx:
             return None
-        # 到点了，但要求这一刻数据完整、分数有效、没有信号；不满足就顺延到本小时内下一个桶
+        # 到点了，但要求这一刻数据完整、分数有效、没有信号；不满足就顺延到下一个桶（本小时内）
         if not row["complete"] or not score.valid or any(e["kind"] == "signal" for e in created):
             return None
         self.ctrl_done += 1

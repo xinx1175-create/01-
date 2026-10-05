@@ -12,6 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import ConditionsCfg
+from .schema import flip_col
 
 log = logging.getLogger(__name__)
 
@@ -101,7 +102,10 @@ class Conditions:
         self.seen: deque[int] = deque()
         self.hist: deque[tuple[int, float]] = deque()
         self.sorted: list[float] = []
-        self.signs: deque[tuple[int, int]] = deque()
+        # 每个门槛：上一次超出 ±门槛 时的方向，和窗口内的翻转时刻
+        self.flip_ths = sorted(set(cfg.flip_record_thresholds) | {cfg.flip_threshold})
+        self.flip_dir: dict[float, int] = {t: 0 for t in self.flip_ths}
+        self.flip_at: dict[float, deque[int]] = {t: deque() for t in self.flip_ths}
 
     def update(self, row: dict, score_valid: bool, S: float | None) -> dict:
         s = int(row["start_ms"])
@@ -134,14 +138,21 @@ class Conditions:
             bisect.insort(self.sorted, rng)
         nt_low = rank is not None and rank < self.cfg.low_vol_percentile
 
-        # 分数正负翻转次数
+        # 分数翻转：这一次超出 ±门槛 的方向和上一次超出 ±门槛 时相反，在此刻记一次；门槛以内的摆动不算。
+        # 上一次超出发生在窗口之外也照样算，窗口只框翻转发生的时刻。门槛 0 即规格原文：任何正负变化都算
         fcut = s - self.flip_ms
-        while self.signs and self.signs[0][0] <= fcut:
-            self.signs.popleft()
-        if score_valid and S and abs(S) >= self.cfg.flip_min_abs:
-            self.signs.append((s, 1 if S > 0 else -1))
-        q = self.signs
-        flips = sum(1 for i in range(1, len(q)) if q[i][1] != q[i - 1][1])
+        counts = {}
+        for t in self.flip_ths:
+            if score_valid and S is not None and abs(S) > t:
+                d = 1 if S > 0 else -1
+                if self.flip_dir[t] and d != self.flip_dir[t]:
+                    self.flip_at[t].append(s)
+                self.flip_dir[t] = d
+            q = self.flip_at[t]
+            while q and q[0] <= fcut:
+                q.popleft()
+            counts[t] = len(q)
+        flips = counts[self.cfg.flip_threshold]
         nt_flips = flips >= self.cfg.flip_count
 
         # 经济数据：按信号时刻（桶结束）判断
@@ -157,8 +168,11 @@ class Conditions:
             reasons.append(f"calendar:{ev}")
         if nt_data:
             reasons.append("data")
-        return {
+        out = {
             "range_pct": rng, "range_rank": rank, "range_hist_h": hist_h, "flips": flips,
             "nt_low_vol": nt_low, "nt_flips": nt_flips, "nt_calendar": ev is not None,
             "nt_data": nt_data, "no_trade": bool(reasons), "no_trade_reason": "|".join(reasons),
         }
+        for t in self.cfg.flip_record_thresholds:
+            out[flip_col(t)] = counts[t]
+        return out

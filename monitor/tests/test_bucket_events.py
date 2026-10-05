@@ -86,24 +86,53 @@ def test_conditions_flips_and_low_vol(cfg_factory, tmp_path):
     for i in range(40):
         px = 100 + (0.5 if i % 2 else 0) * (1 if i < 30 else 0.01)  # 后段几乎不动
         row = {"start_ms": T0 + i * W, "complete": True, "high": px + 0.1, "low": px - 0.1, "close": px}
-        out = cond.update(row, True, 10 if i % 2 else -10)
+        out = cond.update(row, True, 30 if i % 2 else -30)
     assert out["flips"] >= 3 and out["nt_flips"]
     assert out["nt_low_vol"] and out["range_rank"] < 30
 
 
-def test_flip_min_abs_ignores_small_wiggles(cfg_factory):
-    def run(min_abs):
-        cfg = cfg_factory(conditions={"flip_window_minutes": 2, "flip_min_abs": min_abs})
-        cond = Conditions(cfg.conditions, 15, Calendar(None, 15, 30))
-        out = None
-        # 分数在 ±2 之间来回摆，中间有一次真正从 +30 到 −30
-        for i, S in enumerate([2, -2, 2, -2, 30, -30, 2, -2]):
-            row = {"start_ms": T0 + i * W, "complete": True, "high": 100.1, "low": 99.9, "close": 100}
-            out = cond.update(row, True, S)
-        return out["flips"]
+def _flips(cfg, scores, valid=None):
+    """按顺序喂一串分数（每个一个桶），返回最后一个桶的条件结果。"""
+    cond = Conditions(cfg.conditions, 15, Calendar(None, 15, 30))
+    out = None
+    for i, S in enumerate(scores):
+        row = {"start_ms": T0 + i * W, "complete": True, "high": 100.1, "low": 99.9, "close": 100}
+        out = cond.update(row, True if valid is None else valid[i], S)
+    return out
 
-    assert run(0) == 7      # 规格原文：每次正负变化都算
-    assert run(15) == 1     # 只看 |S| ≥ 15 的桶
+
+def test_flip_definition_examples(cfg_factory):
+    cfg = cfg_factory()  # flip_threshold = 20
+    # 你给的两个例子：+25 → +5 → −3 → +22 不算翻转；+25 → −22 算一次
+    assert _flips(cfg, [25, 5, -3, 22])["flips"] == 0
+    assert _flips(cfg, [25, -22])["flips"] == 1
+    # 中间在 ±20 以内来回摆多少次都不算，只看两次超出时的方向
+    assert _flips(cfg, [25, 5, -3, 4, -19, 19, -22])["flips"] == 1
+    # 刚好 ±20 不算超出
+    assert _flips(cfg, [25, -20, 20, -20])["flips"] == 0
+    # 一次超出持续多个桶只算一个方向；之后每反向超出一次记一次
+    assert _flips(cfg, [25, 30, 28, -21, -40, 21, -21])["flips"] == 3
+    # 分数无效的桶不参与
+    assert _flips(cfg, [25, -50, -22], valid=[True, False, True])["flips"] == 1
+
+
+def test_flip_is_counted_when_it_happens_even_if_previous_excursion_left_window(cfg_factory):
+    # 窗口 2 分钟 = 8 个桶。+25 之后 12 个桶都在 ±20 以内，再跌破 −20：
+    # 上一次超出早已滑出窗口，但翻转发生在窗口内，照样算。
+    cfg = cfg_factory(conditions={"flip_window_minutes": 2})
+    out = _flips(cfg, [25] + [3] * 12 + [-22])
+    assert out["flips"] == 1
+    # 翻转本身滑出窗口后就不再计数
+    out = _flips(cfg, [25, -22] + [3] * 8)
+    assert out["flips"] == 0
+
+
+def test_flip_counts_recorded_per_threshold(cfg_factory):
+    cfg = cfg_factory()
+    out = _flips(cfg, [2, -2, 15, -15, 25, -25, 35, -35])
+    # 门槛 0 即规格原文：任何正负变化都算（7 次）；门槛越高，算进来的越少
+    assert (out["flips_0"], out["flips_10"], out["flips_20"], out["flips_30"]) == (7, 5, 3, 1)
+    assert out["flips"] == out["flips_20"] == 3 and out["nt_flips"]
 
 
 # ---------- 信号事件 ----------
@@ -195,20 +224,40 @@ def test_limit_fill_evaluated_from_trade_stream(cfg_factory):
     assert e["limit_fill_5s"] is False and e["limit_fill_15s"] is True
 
 
-def test_control_group_deterministic_and_skips_signal_buckets(cfg_factory):
-    cfg = cfg_factory()
+def test_control_group_four_per_hour_one_per_quarter(cfg_factory):
+    cfg = cfg_factory()  # control_per_hour = 4
 
     def run():
         eng = EventEngine(cfg, 0.01)
         out = []
-        for i in range(240):
+        for i in range(480):  # 两个小时
             c, _ = eng.on_bucket(row(i), sc(5), NOCOND, cap())
             out += [e for e in c if e["kind"] == "control"]
         return out
 
     a, b = run(), run()
-    assert len(a) == 1 and a[0]["event_id"] == b[0]["event_id"]
-    assert a[0]["tier"] is None
+    assert [e["event_id"] for e in a] == [e["event_id"] for e in b]  # 种子固定，可复现
+    assert len(a) == 8 and all(e["tier"] is None for e in a)
+    # 每 15 分钟一段，每段恰好一条
+    quarters = [(e["ts_ms"] - W - T0) // 900_000 for e in a]
+    assert quarters == list(range(8))
+    assert {e["direction"] for e in a} <= {1, -1}
+
+
+def test_control_skips_signal_bucket(cfg_factory):
+    cfg = cfg_factory(events={"control_per_hour": 1})
+    eng = EventEngine(cfg, 0.01)
+    # 先找出这一小时抽到的时刻，再让那个桶正好出信号
+    eng.on_bucket(row(0), sc(5), NOCOND, cap())
+    idx = eng.ctrl_slots[0][0]
+    got = []
+    for i in range(1, 240):
+        S = 45 if i == idx else 5
+        c, _ = eng.on_bucket(row(i), sc(S), NOCOND, cap())
+        got += [(i, e["kind"]) for e in c]
+    ctrl = [i for i, k in got if k == "control"]
+    if idx >= 1:
+        assert ctrl == [idx + 1]  # 顺延到下一个桶
 
 
 def test_gap_marks_followup_incomplete(cfg_factory):

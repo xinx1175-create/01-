@@ -15,7 +15,7 @@ from .notify import Notifier
 from .okx import Feed, contract_size, now_ms
 from .orderbook import BookInvalid, OrderBook
 from .report import write_daily
-from .schema import BUCKET_COLUMNS, event_columns
+from .schema import bucket_columns, event_columns
 from .score import ScoreEngine
 from .storage import (TRADE_COLUMNS, DailyCsv, DailyJsonl, day_files, load_json, read_csv,
                       save_json)
@@ -43,9 +43,10 @@ class Monitor:
         self.cond = Conditions(c, cfg.bucket.width_s, self.cal)
         self.events = EventEngine(cfg, self.ct)
         self.ev_cols = [n for n, _ in event_columns(cfg)]
+        self.b_cols = bucket_columns(cfg)
 
         d = cfg.data_dir
-        self.w_buckets = DailyCsv(d / "buckets", [n for n, _ in BUCKET_COLUMNS])
+        self.w_buckets = DailyCsv(d / "buckets", [n for n, _ in self.b_cols])
         self.w_events = DailyCsv(d / "events", self.ev_cols)
         self.w_trades = DailyCsv(d / "raw" / "trades", TRADE_COLUMNS)
         self.w_books = DailyJsonl(d / "raw" / "books")
@@ -72,7 +73,7 @@ class Monitor:
         # 按文件名取最近几天，不按本机日期算，免得本机时钟和交易所时间对不上时漏读
         bdir = self.cfg.data_dir / "buckets"
         days = sorted({p.name[:10] for p in bdir.glob("*.csv")})[-(self.cfg.storage.restore_days + 1):]
-        rows = list(read_csv(day_files(bdir, days, ".csv"), dict(BUCKET_COLUMNS)))
+        rows = list(read_csv(day_files(bdir, days, ".csv"), dict(self.b_cols)))
         rows.sort(key=lambda r: r["start_ms"])
         last = None
         n = 0

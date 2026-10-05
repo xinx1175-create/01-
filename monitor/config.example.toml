@@ -62,7 +62,8 @@ low_vol_lookback_days = 7
 low_vol_percentile = 30
 flip_window_minutes = 30
 flip_count = 3
-flip_min_abs = 0                          # 实现：|S| 低于它的桶不参与翻转计数；0 = 按规格原文，任何正负变化都算
+flip_threshold = 20                       # 分数超出 ±20 时的方向与上一次超出 ±20 时相反，才记一次翻转；±20 以内的摆动不算
+flip_record_thresholds = [0, 10, 20, 30]  # 每个门槛各记一份翻转次数（flips_0 …），以后用真实数据校准 flip_threshold
 calendar_file = "calendar.csv"            # 手工维护的经济数据日程，相对本配置文件
 calendar_before_minutes = 15
 calendar_after_minutes = 30
@@ -90,7 +91,7 @@ followup_minutes = 30
 price_horizons_s = [15, 60, 120, 300, 900, 1800]
 limit_fill_windows_s = [5, 15]
 market_order_notional_usdt = 600
-control_per_hour = 1                      # 对照组：每小时随机抽 1 个没有信号的时刻
+control_per_hour = 4                      # 对照组：每小时 4 条。一小时等分 4 段，每段随机抽一个没有信号的时刻
 control_seed = "flowmon-v0.1"             # 实现：抽样种子。同一份数据回放时抽到同一批时刻
 
 [evaluation]                              # §11 阶段一通过标准。看到结果之前定死，事后不改
@@ -99,10 +100,11 @@ dedupe_minutes = 5                        # 相邻信号间隔不足 5 分钟，
 bootstrap_reps = 10000                    # 自助抽样次数
 bootstrap_seed = "flowmon-eval-v1"        # 自助抽样种子，固定后同一份数据结果不变
 confidence = 0.95                         # 置信区间
-weekly_positive_share = 0.75              # 至少四分之三的周为正
+segments = 4                              # 整段数据按时间等分成 4 段
+segments_positive_min = 3                 # 至少 3 段信号均值为正
 min_signals = 300                         # §11 最低数据量：至少 300 次信号
 min_weeks = 2                             # §11 最低数据量：连续至少 2 周
-exclude_no_trade = false                  # 待确认：是否剔除处于 §8 不交易条件的信号
+exclude_no_trade = true                   # 处于 §8 不交易条件的信号不进判定（策略本来不会在这些时候下单）；全部信号另列参考行
 
 [storage]
 data_dir = "data"                         # 相对本配置文件

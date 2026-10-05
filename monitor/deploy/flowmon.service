@@ -10,7 +10,7 @@ StartLimitIntervalSec=0
 [Service]
 Type=simple
 User=flowmon
-WorkingDirectory=/opt/flowmon/monitor
+WorkingDirectory=/opt/flowmon/src/monitor
 ExecStart=/opt/flowmon/venv/bin/python -m flowmon run --config /opt/flowmon/config.toml
 # 程序异常退出（不是正常停止）时推一条通知，然后 5 秒后自动拉起
 ExecStopPost=/bin/sh -c 'if [ "$SERVICE_RESULT" != "success" ]; then /opt/flowmon/venv/bin/python -m flowmon notify --config /opt/flowmon/config.toml "异常退出" "result=$SERVICE_RESULT code=$EXIT_CODE status=$EXIT_STATUS，systemd 会自动重启"; fi'

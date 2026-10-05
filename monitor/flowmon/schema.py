@@ -46,11 +46,23 @@ BUCKET_COLUMNS: list[tuple[str, type]] = [
     ("range_pct", float),        # 最近 low_vol_window_minutes 的 (最高−最低)/收盘，百分比
     ("range_rank", float),       # 它在过去 lookback 天同类数值里的分位（0–100）
     ("range_hist_h", float),     # 算分位用了多少小时的历史
-    ("flips", int),              # 最近 flip_window_minutes 内力量分数正负翻转次数
+    ("flips", int),              # 最近 flip_window_minutes 内的翻转次数（按 flip_threshold 判定，§8 用这个）
     ("nt_low_vol", bool), ("nt_flips", bool), ("nt_calendar", bool), ("nt_data", bool),
     ("no_trade", bool),
     ("no_trade_reason", str),
 ]
+
+
+def bucket_columns(cfg: Config) -> list[tuple[str, type]]:
+    """桶表的列：固定列 + 每个记录门槛一列翻转次数（flips_0、flips_10 …），紧跟在 flips 后面。"""
+    cols = list(BUCKET_COLUMNS)
+    i = [n for n, _ in cols].index("flips") + 1
+    cols[i:i] = [(flip_col(t), int) for t in cfg.conditions.flip_record_thresholds]
+    return cols
+
+
+def flip_col(t: float) -> str:
+    return f"flips_{_num(t)}"
 
 
 def _num(x: float) -> str:

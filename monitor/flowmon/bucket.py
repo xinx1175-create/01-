@@ -150,7 +150,7 @@ class Bucket:
 
     def finish(self, prev_close: float | None, oi: tuple[int, float] | None,
                funding: float | None, ct_val: float, oi_stale_ms: int, judge: bool = True) -> dict:
-        """封桶，产出 BUCKET_COLUMNS 里属于桶本身的那部分字段。
+        """封桶，产出桶表里属于桶本身的那部分字段（列定义见 schema.bucket_columns）。
 
         judge=False 时不自行判断完整性，只用预先放进 reasons 的原因（回放沿用实时记录）。
         """

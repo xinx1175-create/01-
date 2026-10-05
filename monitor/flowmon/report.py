@@ -5,14 +5,14 @@ import statistics
 from collections import Counter
 
 from .config import Config
-from .schema import BUCKET_COLUMNS, event_columns
+from .schema import bucket_columns, event_columns
 from .storage import day_files, read_csv
 
 
 def build_daily(cfg: Config, day: str) -> tuple[str, str] | None:
     """返回 (Markdown 正文, 推送用的一行摘要)；那天没有数据返回 None。"""
     d = cfg.data_dir
-    btypes = dict(BUCKET_COLUMNS)
+    btypes = dict(bucket_columns(cfg))
     rows = list(read_csv(day_files(d / "buckets", [day], ".csv"), btypes))
     if not rows:
         return None

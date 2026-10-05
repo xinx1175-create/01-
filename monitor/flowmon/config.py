@@ -85,7 +85,8 @@ class ConditionsCfg:
     low_vol_percentile: float
     flip_window_minutes: float
     flip_count: int
-    flip_min_abs: float
+    flip_threshold: float
+    flip_record_thresholds: list[float]
     calendar_file: str
     calendar_before_minutes: float
     calendar_after_minutes: float
@@ -130,7 +131,8 @@ class EvaluationCfg:
     bootstrap_reps: int
     bootstrap_seed: str
     confidence: float
-    weekly_positive_share: float
+    segments: int
+    segments_positive_min: int
     min_signals: int
     min_weeks: float
     exclude_no_trade: bool
@@ -283,4 +285,10 @@ def _validate(c: Config) -> None:
     need(ev.horizon_s in c.events.price_horizons_s, "evaluation.horizon_s 必须在 events.price_horizons_s 里")
     need(0 < ev.confidence < 1, "evaluation.confidence 应在 (0, 1)")
     need(ev.bootstrap_reps >= 1, "evaluation.bootstrap_reps 至少 1")
-    need(0 < ev.weekly_positive_share <= 1, "evaluation.weekly_positive_share 应在 (0, 1]")
+    need(ev.segments >= 1, "evaluation.segments 至少 1")
+    need(1 <= ev.segments_positive_min <= ev.segments, "evaluation.segments_positive_min 应在 [1, segments]")
+    cd = c.conditions
+    need(cd.flip_threshold >= 0 and all(t >= 0 for t in cd.flip_record_thresholds),
+         "conditions.flip_threshold 和 flip_record_thresholds 不能为负")
+    need(len(set(cd.flip_record_thresholds)) == len(cd.flip_record_thresholds),
+         "conditions.flip_record_thresholds 不能重复")
