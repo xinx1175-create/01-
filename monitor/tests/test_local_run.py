@@ -353,3 +353,125 @@ def test_notify_retries_until_network_is_back(tmp_path):
 
     asyncio.run(main())
     assert calls == ["电脑睡眠过"] * 3
+
+
+# ---------- 睡眠醒来后补封：不带旧价格、旧盘口，分批处理 ----------
+
+def _awake_monitor(tmp_path, n=40):
+    """盘口就绪、有成交地跑 n 个桶，返回 (monitor, 时钟)。时钟可以拨，用来模拟睡眠。"""
+    import flowmon.okx as okx
+    cfg = small_cfg(tmp_path)
+    m = Monitor(cfg, instrument())
+    m.book.apply_snapshot([["59999.9", "5", "0", "1"]], [["60000.1", "5", "0", "1"]], T0, 1, None)
+    for i in range(n):
+        s = T0 + i * W
+        m.agg.on_trade(s + 100, 60000.0 + i, 10, "buy", 1, s + 150)
+        m.agg.on_oi(s + 200, 5000.0 + i)
+        for row, b in m.agg.advance(s + W + 600, m.book):
+            m._on_bucket(row, b)
+    clock = {"w": (T0 + n * W) / 1000, "m": 100.0}
+    m._wall = lambda: clock["w"]
+    m._mono = lambda: clock["m"]
+
+    def sleep_for(hours):
+        m._check_clock()
+        clock["w"] += hours * 3600
+        clock["m"] += 1
+        m._check_clock()
+        m.max_ts = int(clock["w"] * 1000)
+        m.offset_ms = okx.now_ms() - m.max_ts  # 本地时钟估计的交易所时间 = 醒来那一刻
+
+    return m, sleep_for
+
+
+def test_sleep_catch_up_has_no_stale_price_or_book(tmp_path, caplog):
+    m, sleep_for = _awake_monitor(tmp_path)
+    # 睡前刚出了一个信号：它之后的价格都落在睡眠里
+    ev = m.events._new("control", 1, None, m.last_row, __import__("flowmon.score", fromlist=["x"]).ScoreResult(S=0.0),
+                       {"no_trade": False, "no_trade_reason": ""}, None, T0 + 40 * W)
+    m.events.pending.append(ev)
+    sleep_for(72)
+    calls = []
+    orig = m.agg.advance
+    m.agg.advance = lambda wm, book, limit=None: calls.append(limit) or orig(wm, book, limit)
+    with caplog.at_level("INFO"):
+        asyncio.run(m._close_buckets())
+    m.close()
+    rows = read_rows(m.cfg.data_dir)
+    sl = [r for r in rows if int(r["start_ms"]) >= T0 + 41 * W]
+    assert 72 * 240 - 3 <= len(sl) <= 72 * 240  # 最后一两个桶还在宽限期里，没封
+    assert all("sleep" in r["incomplete_reason"] and r["close"] == "" and r["bid1"] == "" for r in sl)
+    # 睡眠期间没有再存盘口快照
+    books = sum(1 for p in (m.cfg.data_dir / "raw" / "books").glob("*") for _ in p.open())
+    assert books == 40
+    # 分批封、每批有上限；不逐个桶写日志，只写一行汇总
+    assert set(calls) == {200} and len(calls) > 80
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum(1 for x in msgs if x.startswith("桶 ")) == 0
+    summary = [x for x in msgs if x.startswith("补封积压的桶 ")]
+    assert len(summary) == 1 and f"补封积压的桶 {len(sl) + 1} 个" in summary[0]  # 加上睡着那一刻所在的桶
+    assert "sleep" in summary[0]
+    # 跟踪中的事件：睡眠里的「之后 N 分钟价格」是未知的，判定时自然被排除
+    from flowmon.evaluate import same_dir_return
+    events = read_rows(m.cfg.data_dir, "events")
+    e = next(x for x in events if x["event_id"] == ev["event_id"])
+    assert e["px_15s"] == e["px_60s"] == e["px_300s"] == "" and e["followup_complete"] == "0"
+    assert same_dir_return({**ev, "px_300s": None}, 300) is None
+
+
+def test_restart_fill_runs_in_batches_without_double_fill(tmp_path):
+    cfg = small_cfg(tmp_path)
+    m1 = Monitor(cfg, instrument())
+    for i in range(40):
+        m1._on_bucket(*live_row(T0 + i * W, i))
+    m1.close()
+    m2 = Monitor(cfg, instrument())
+    m2.restore()
+    t1 = T0 + 40 * W + 2 * DAY
+    m2.agg._bucket(t1)  # 重启后第一个新桶从 t1 开始
+    m2.agg.on_trade(t1 + 100, 60000.0, 1, "buy", 1, t1 + 120)
+    m2.max_ts = t1 + W + 600
+    import flowmon.okx as okx
+    m2.offset_ms = okx.now_ms() - m2.max_ts
+    yields = []
+    real_sleep = asyncio.sleep
+
+    async def counting_sleep(x, *a):
+        yields.append(x)
+        return await real_sleep(x, *a)
+
+    async def main():
+        asyncio.sleep = counting_sleep
+        try:
+            await m2._close_buckets()
+        finally:
+            asyncio.sleep = real_sleep
+        await real_sleep(0.3)  # 等后台线程写完日报
+
+    asyncio.run(main())
+    m2.close()
+    rows = read_rows(cfg.data_dir)
+    starts = [int(r["start_ms"]) for r in rows]
+    assert starts == list(range(T0, t1 + W, W)), "占位桶不重复、不漏"
+    assert sum(r["incomplete_reason"] == "downtime" for r in rows) == 2 * DAY // W
+    assert yields.count(0) >= (2 * DAY // W) // 500, "补占位桶时分批让出事件循环"
+    # 跨过的日子在后台线程里补了日报（重启在 10-01 23:50，10-01 当天还没结束）
+    assert not (cfg.data_dir / "reports" / "2026-10-01.md").exists()
+    for d in ("2026-09-29", "2026-09-30"):
+        assert (cfg.data_dir / "reports" / f"{d}.md").exists(), d
+
+
+def test_restart_without_network_does_not_reuse_old_price(tmp_path):
+    """重启后网络还没好：启动中、断线的桶没有成交，价格留空，不沿用停机前的收盘。"""
+    cfg = small_cfg(tmp_path)
+    m1 = Monitor(cfg, instrument())
+    for i in range(10):
+        m1._on_bucket(*live_row(T0 + i * W, i))
+    m1.close()
+    m2 = Monitor(cfg, instrument())
+    m2.restore()
+    assert m2.agg.prev_close is not None
+    m2.agg.set_down("startup", T0 + 20 * W)
+    m2.agg._bucket(T0 + 20 * W)
+    rows = [r for r, _ in m2.agg.advance(T0 + 25 * W + 600, m2.book)]
+    assert rows and all(r["close"] is None and "startup" in r["incomplete_reason"] for r in rows)

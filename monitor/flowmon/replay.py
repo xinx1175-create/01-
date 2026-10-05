@@ -74,7 +74,8 @@ class Replayer:
 
     def warm_up(self, score: ScoreEngine, cond: Conditions, day_from: str) -> tuple[int, float | None]:
         """回放范围之前的实时桶喂给分数和不交易条件，读的天数和实时重启时 restore() 一样。
-        返回 (用了多少个桶, 最后一个收盘)：回放第一个桶没有成交时，价格沿用它，和实时一样。"""
+        返回 (用了多少个桶, 最后一个桶的收盘)：回放第一个桶没有成交时，价格沿用它，和实时一样
+        （最后一个桶价格未知时为空，也和实时一样）。"""
         cfg = self.cfg
         bdir = self.src / "buckets"
         days = sorted({p.name[:10] for p in bdir.glob("*.csv") if p.name[:10] < day_from})
@@ -87,8 +88,7 @@ class Replayer:
             sc = score.update(r)
             cond.update(r, sc.valid, sc.S)
             last = r["start_ms"]
-            if r["close"] is not None:
-                close = r["close"]
+            close = r["close"]
             n += 1
         return n, close
 
@@ -162,8 +162,7 @@ class Replayer:
                         b.liq_short_ct += sz
                 li += 1
             if cov is None:
-                if b.close is not None:
-                    prev_close = b.close
+                # 实时没记录的时段：实时也没见过这些成交，「上一个收盘」不动
                 stats["skipped"] += 1
                 return
             ok, why = cov
@@ -183,8 +182,7 @@ class Replayer:
                 fr = funding[k - 1][1] if k > 0 else None
                 row = b.finish(prev_close, pick_oi(oi, e), fr, self.ct, int(cfg.bucket.oi_stale_s * 1000),
                                judge=False)
-                if row["close"] is not None:
-                    prev_close = row["close"]
+                prev_close = row["close"]  # 和实时一样：价格未知时也清掉
             sc = score.update(row)
             cd = cond.update(row, sc.valid, sc.S)
             full = {**row, **sc.as_row(), **cd}

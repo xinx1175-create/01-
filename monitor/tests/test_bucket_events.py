@@ -36,9 +36,19 @@ def test_aggregator_closes_on_watermark_and_marks_down(cfg_factory):
     agg.clear_down({"disconnect"}, T0 + 3 * W + 1000)
     agg.on_oi(T0 + 3 * W + 2000, 502.0)
     rows = [r for r, _ in agg.advance(T0 + 5 * W + cfg.bucket.close_grace_ms, book)]
-    assert [r["complete"] for r in rows] == [False, False, False, True]
-    assert rows[0]["incomplete_reason"] == "disconnect"
-    assert rows[0]["close"] == 101  # 没成交沿用上一个收盘
+    assert [r["complete"] for r in rows] == [False, False, False, False]
+    # 断线期间没成交：价格未知，留空，不沿用断线前的收盘（原因里另记 no_price）
+    assert rows[0]["incomplete_reason"] == "disconnect|no_price"
+    assert all(r["close"] is None and r["high"] is None for r in rows[:3])
+    # 重连后第一个桶也没成交：断线之后还没见过成交，价格仍未知
+    assert rows[3]["close"] is None and rows[3]["incomplete_reason"] == "no_price"
+    # 来了成交之后恢复；之后行情通着、只是没成交的桶，沿用上一个收盘
+    agg.on_oi(T0 + 5 * W + 1000, 503.0)
+    agg.on_trade(T0 + 5 * W + 2000, 102.0, 1, "buy", 1, T0 + 5 * W + 2010)
+    agg.on_oi(T0 + 6 * W + 1000, 504.0)
+    r6, r7 = [r for r, _ in agg.advance(T0 + 7 * W + cfg.bucket.close_grace_ms, book)]
+    assert r6["complete"] and r6["close"] == 102
+    assert r7["complete"] and r7["close"] == 102 and r7["trade_count"] == 0
 
 
 def test_oi_stale_and_late_trade(cfg_factory):

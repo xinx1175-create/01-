@@ -8,6 +8,7 @@ import os
 import shutil
 import signal
 import time
+from collections import Counter
 from datetime import date, timedelta
 
 from .bucket import DOWNTIME, Aggregator, Bucket, day_of, downtime_row, iso_utc
@@ -31,10 +32,17 @@ log = logging.getLogger(__name__)
 DOWN_ALL = {"startup", "disconnect", "stale", "book_invalid", "sleep"}
 DAY_MS = 86_400_000
 AC_POWER = "AC Power"
+# 醒来后、重启后积压的桶分批处理：每批最多这么多个，批与批之间让出事件循环，免得行情、心跳、停止信号都卡住
+CATCHUP_BUCKETS = 200
+FILL_BUCKETS = 500
 
 
 class AlreadyRunning(RuntimeError):
     """同一个数据目录已经有一个监控器在写。两个同时写会把数据搞乱。"""
+
+
+def _num(x) -> str:
+    return "-" if x is None else f"{x:.3f}"
 
 
 def _next_day(d: str) -> str:
@@ -117,8 +125,7 @@ class Monitor:
             sc = self.score.update(r)
             self.cond.update(r, sc.valid, sc.S)
             last = r["start_ms"]
-            if r["close"] is not None:
-                self.agg.prev_close = r["close"]
+            self.agg.prev_close = r["close"]  # 最后一个桶价格未知（例如停机占位桶）时为空
             n += 1
         if last is not None:
             self.agg.min_start = last + self.w
@@ -252,7 +259,8 @@ class Monitor:
 
     # ---------- 封桶后的处理 ----------
 
-    def _on_bucket(self, row: dict, b: Bucket) -> None:
+    def _on_bucket(self, row: dict, b: Bucket, batch: bool = False) -> None:
+        """处理一个封好的桶。batch=True 是补封积压的桶：不逐个存状态、刷盘、写日志，整批结束时 _end_batch 一次做。"""
         start = row["start_ms"]
         end = start + self.w
         day = day_of(start)
@@ -278,29 +286,52 @@ class Monitor:
                      e["no_trade_reason"] or "否")
         for e in done:
             self.w_events.write(day_of(e["ts_ms"]), public(e, self.ev_cols))
-        save_json(self.state_path, self.events.state())
-        self.w_buckets.flush()
-        self.w_events.flush()
+        if not batch:
+            self._save_state()
         if row["latency_ms"] is not None:
             self.offset_ms = row["latency_ms"]
         if row["complete"]:
             self.last_complete_wall = self._wall()
         self.n_buckets += 1
         self.last_row = full
-        s_txt = f"{sc.S:.1f}" if sc.S is not None else "-"
-        log.info("桶 %s 完整=%s S=%s%s 买=%.3f 卖=%.3f OI=%s 延迟=%s",
-                 row["time_utc"], int(row["complete"]), s_txt, "" if sc.valid else f"（无效:{sc.note}）",
-                 row["buy_vol"], row["sell_vol"], row["oi"], row["latency_ms"])
+        if not batch:
+            s_txt = f"{sc.S:.1f}" if sc.S is not None else "-"
+            log.info("桶 %s 完整=%s S=%s%s 买=%s 卖=%s OI=%s 延迟=%s",
+                     row["time_utc"], int(row["complete"]), s_txt, "" if sc.valid else f"（无效:{sc.note}）",
+                     _num(row["buy_vol"]), _num(row["sell_vol"]), row["oi"], row["latency_ms"])
         self._maybe_report(end)
 
-    def _fill_downtime(self, a: int, b: int) -> None:
-        """补写 [a, b) 的停机占位桶（标为不完整，原因 downtime），照常喂给分数、不交易条件和事件跟踪，
-        回放时也会生成同样的占位桶。停机太久只补最近 restore_days 天，再早的不影响任何窗口。"""
+    def _save_state(self) -> None:
+        save_json(self.state_path, self.events.state())
+        self.w_buckets.flush()
+        self.w_events.flush()
+
+    def _downtime_start(self, a: int, b: int) -> int:
+        """停机太久只补最近 restore_days 天，再早的不影响任何窗口。"""
         keep = (self.cfg.storage.restore_days * DAY_MS // self.w) * self.w
         if b - a > keep:
             log.warning("停机 %.1f 天，只补最近 %d 天的占位桶", (b - a) / DAY_MS, self.cfg.storage.restore_days)
-            a = b - keep
-        n = 0
+            return b - keep
+        return a
+
+    def _fill_downtime(self, a: int, b: int) -> None:
+        """补写 [a, b) 的停机占位桶（标为不完整，原因 downtime），照常喂给分数、不交易条件和事件跟踪，
+        回放时也会生成同样的占位桶。"""
+        a = self._downtime_start(a, b)
+        self._write_placeholders(a, b)
+        log.info("补写停机占位桶 %d 个：%s → %s", (b - a) // self.w, iso_utc(a), iso_utc(b))
+
+    async def _fill_downtime_async(self, a: int, b: int) -> None:
+        """同 _fill_downtime，分批写，批与批之间让出事件循环：停机几天后重启要补上万个桶，不能卡住刚连上的行情。"""
+        a = self._downtime_start(a, b)
+        step = FILL_BUCKETS * self.w
+        for s in range(a, b, step):
+            self._write_placeholders(s, min(b, s + step))
+            await asyncio.sleep(0)
+        self._save_state()
+        log.info("补写停机占位桶 %d 个：%s → %s", (b - a) // self.w, iso_utc(a), iso_utc(b))
+
+    def _write_placeholders(self, a: int, b: int) -> None:
         for s in range(a, b, self.w):
             row = downtime_row(s, self.w)
             sc = self.score.update(row)
@@ -311,23 +342,45 @@ class Monitor:
             _, done = self.events.on_bucket(full, sc, cond, None)
             for e in done:
                 self.w_events.write(day_of(e["ts_ms"]), public(e, self.ev_cols))
-            n += 1
-        log.info("补写停机占位桶 %d 个：%s → %s", n, iso_utc(a), iso_utc(b))
+            self.last_start = s
+        # agg.prev_close 不用动：重启后的头几个桶一定带 startup 原因，没有成交时价格留空，不会沿用停机前的价格
 
     def _maybe_report(self, end: int) -> None:
         # 某天的事件要在次日 0 点再过跟踪时长后才全部落盘，那时再写这一天的日报。
         # 停机跨过好几天时，中间每一天都补一份
         target = day_of(end - self.follow_ms)
         if self.report_day is not None and target > self.report_day and self.cfg.health.daily_report:
+            days = []
             d = self.report_day
             while d < target:
-                summary = write_daily(self.cfg, d)
-                if summary:
-                    log.info("日报：%s", summary)
-                    if self.cfg.notify.daily_summary:
-                        self._notify("日报", summary, None)
+                days.append(d)
                 d = _next_day(d)
+            # 日报要读整天的桶表和事件表：先刷盘，再放到后台线程里写，不卡住行情（停机几天后一次要补好几份）
+            self.w_buckets.flush()
+            self.w_events.flush()
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                for d in days:
+                    self._report_done(write_daily(self.cfg, d))
+            else:
+                self._spawn(self._write_reports(days))
         self.report_day = target
+
+    async def _write_reports(self, days: list[str]) -> None:
+        for d in days:
+            try:
+                summary = await asyncio.to_thread(write_daily, self.cfg, d)
+            except Exception:
+                log.exception("写 %s 的日报失败", d)
+                continue
+            self._report_done(summary)
+
+    def _report_done(self, summary: str | None) -> None:
+        if summary:
+            log.info("日报：%s", summary)
+            if self.cfg.notify.daily_summary:
+                self._notify("日报", summary, None)
 
     # ---------- 睡眠检测 ----------
 
@@ -345,6 +398,9 @@ class Monitor:
         # 从睡前那一刻起，到重新连上拿到盘口快照为止，桶都标为不完整（sleep）；本地盘口已不可信，强制重连
         at = int(w0 * 1000 - self.offset_ms)
         self.agg.set_down("sleep", at)
+        # 睡前的盘口作废：不然醒来后补封的每个睡眠桶都会存一份旧盘口、填上旧的买一卖一
+        self.agg.book_reset(at)
+        self.book.reset()
         self.feed.request_reconnect("sleep")
         rec = {"from_utc": iso_utc(int(w0 * 1000)), "to_utc": iso_utc(int(w1 * 1000)), "seconds": round(slept, 1)}
         self.sleeps = (self.sleeps + [rec])[-20:]
@@ -369,8 +425,7 @@ class Monitor:
         last_flush = time.monotonic()
         while not self.stop.is_set():
             self._check_clock()
-            for row, b in self.agg.advance(self._watermark(), self.book):
-                self._on_bucket(row, b)
+            await self._close_buckets()
             t = time.monotonic()
             if t - last_flush >= self.cfg.storage.raw_flush_s:
                 for wr in (self.w_trades, self.w_books, self.w_misc):
@@ -380,6 +435,32 @@ class Monitor:
                 await asyncio.wait_for(self.stop.wait(), timeout=tick)
             except asyncio.TimeoutError:
                 pass
+
+    async def _close_buckets(self) -> None:
+        """封掉到期的桶。平时每次一两个；电脑醒来后可能积压上万个，分批封，批与批之间让出事件循环。
+        重启后第一个新桶前面的停机占位桶也在这里分批补。"""
+        n, why = 0, Counter()
+        first = last = None
+        while not self.stop.is_set():
+            rows = self.agg.advance(self._watermark(), self.book, limit=CATCHUP_BUCKETS)
+            batch = n > 0 or len(rows) == CATCHUP_BUCKETS
+            for row, b in rows:
+                if self.last_start is not None and row["start_ms"] > self.last_start + self.w:
+                    await self._fill_downtime_async(self.last_start + self.w, row["start_ms"])
+                self._on_bucket(row, b, batch=batch)
+                if batch:
+                    first = first if first is not None else row["start_ms"]
+                    last = row["start_ms"]
+                    n += 1
+                    why.update(x for x in (row["incomplete_reason"] or "").split("|") if x)
+            if batch and rows:
+                self._save_state()
+            if len(rows) < CATCHUP_BUCKETS:
+                break
+            await asyncio.sleep(0)
+        if n:
+            log.info("补封积压的桶 %d 个：%s → %s，不完整原因 %s", n, iso_utc(first), iso_utc(last),
+                     "，".join(f"{k} {v}" for k, v in why.most_common()) or "无")
 
     async def _health(self) -> None:
         h = self.cfg.health

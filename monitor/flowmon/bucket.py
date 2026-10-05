@@ -75,6 +75,12 @@ def pick_oi(updates, end_ms: int) -> tuple[int, float] | None:
     return updates[i - 1] if i > 0 else None
 
 
+DOWNTIME = "downtime"
+# 这些原因说明这个桶的时段里行情没收全（启动中、断线、行情停了、盘口重建、电脑睡眠、监控器没在运行、
+# 回放时实时没记录）。这样的桶没有成交时，价格是未知的，不能沿用上一个收盘
+DATA_GAP = frozenset({"startup", "disconnect", "stale", "book_invalid", "sleep", DOWNTIME, "not_recorded"})
+
+
 @dataclass
 class Bucket:
     start_ms: int
@@ -156,7 +162,9 @@ class Bucket:
         """
         reasons = set(self.reasons)
         o, h, l, c = self.open, self.high, self.low, self.close
-        if c is None:  # 整个桶没有成交，价格沿用上一个收盘
+        if c is None and not reasons & DATA_GAP:
+            # 整个桶没有成交、行情又是通的：价格没变，沿用上一个收盘。行情没收全时价格未知，留空，
+            # 免得事件的「之后 N 分钟价格」被填成断线、睡眠、停机之前的旧价格
             o = h = l = c = prev_close
         cap = self.capture
         if judge:
@@ -200,9 +208,6 @@ class Bucket:
             "complete": not reasons,
             "incomplete_reason": "|".join(sorted(reasons)),
         }
-
-
-DOWNTIME = "downtime"
 
 
 def downtime_row(start_ms: int, width_ms: int) -> dict:
@@ -338,11 +343,12 @@ class Aggregator:
 
     # ---------- 封桶 ----------
 
-    def advance(self, watermark: int, book: OrderBook) -> list[tuple[dict, Bucket]]:
+    def advance(self, watermark: int, book: OrderBook, limit: int | None = None) -> list[tuple[dict, Bucket]]:
+        """封掉水位线之前的桶。limit 限制一次最多封几个（醒来后积压很多时分批封，不卡住事件循环）。"""
         out = []
         if self.cur is None:
             return out
-        while self.cur + self.w + self.grace <= watermark:
+        while self.cur + self.w + self.grace <= watermark and (limit is None or len(out) < limit):
             s = self.cur
             b = self.open.pop(s, None) or Bucket(s, self.w)
             if b.capture is None and book.ready:
@@ -350,8 +356,7 @@ class Aggregator:
             b.reasons |= self._down_reasons(s, s + self.w)
             row = b.finish(self.prev_close, pick_oi(self.oi_updates, s + self.w), self.funding,
                            self.ct_val, self.oi_stale_ms)
-            if row["close"] is not None:
-                self.prev_close = row["close"]
+            self.prev_close = row["close"]  # 价格未知（留空）时也跟着清掉，等有成交再接上
             out.append((row, b))
             self.cur = s + self.w
             self.intervals = [iv for iv in self.intervals if iv[1] >= self.cur]
