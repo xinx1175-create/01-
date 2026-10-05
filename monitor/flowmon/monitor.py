@@ -94,6 +94,7 @@ class Monitor:
         self.guard = SleepGuard(cfg.power.prevent_sleep)
         self.power_src: str | None = None
         self.last_complete_wall: float | None = None  # 最近一个完整的桶封桶时的本机时间
+        self.notify_retry_s = (0, 10, 30, 60, 120)   # 推送失败后隔多久再试
         self.hb = {"last_ok_ms": None, "fail_streak": 0, "last_err": None, "last_err_ms": None,
                    "paused_since_ms": None}
 
@@ -138,14 +139,15 @@ class Monitor:
     # ---------- 行情回调（Feed 调用） ----------
 
     def on_open(self) -> None:
-        self._misc(now_ms(), {"type": "conn", "event": "open"})
+        t = now_ms()
+        self._misc(t, {"type": "conn", "event": "open", "ts": t})
 
     def on_close(self, reason: str) -> None:
         at = self.max_ts or self._est_now()
         self.agg.set_down("stale" if reason == "stale" else "disconnect", at)
         self.agg.book_reset(at)
         self.book.reset()
-        self._misc(at, {"type": "conn", "event": "close", "reason": reason})
+        self._misc(at, {"type": "conn", "event": "close", "reason": reason, "ts": at})
 
     def on_fail_streak(self, n: int) -> None:
         if n == self.cfg.connection.reconnect_fail_notify:
@@ -245,7 +247,7 @@ class Monitor:
             self.agg.set_down("book_invalid", at)
             self.agg.book_reset(at)
             self.book.reset()
-            self._misc(at, {"type": "conn", "event": "book_invalid", "reason": str(e)})
+            self._misc(at, {"type": "conn", "event": "book_invalid", "reason": str(e), "ts": at})
             self._spawn(self.feed.resubscribe_books())
 
     # ---------- 封桶后的处理 ----------
@@ -346,9 +348,11 @@ class Monitor:
         self.feed.request_reconnect("sleep")
         rec = {"from_utc": iso_utc(int(w0 * 1000)), "to_utc": iso_utc(int(w1 * 1000)), "seconds": round(slept, 1)}
         self.sleeps = (self.sleeps + [rec])[-20:]
-        self._misc(at, {"type": "sleep", "from": int(w0 * 1000), "to": int(w1 * 1000), "s": round(slept, 1)})
+        self._misc(at, {"type": "sleep", "ts": at, "from": int(w0 * 1000), "to": int(w1 * 1000),
+                        "secs": round(slept, 1)})
         log.warning("电脑睡眠了约 %.0f 秒（%s → %s），这段时间的桶标为 sleep，重新连接", slept,
                     rec["from_utc"], rec["to_utc"])
+        # 刚醒来时网络多半还没连上，推送在后台重试几次
         self._notify("电脑睡眠过", f"{rec['from_utc'][:19]} 起睡眠了约 {slept / 60:.1f} 分钟，这段没有数据。"
                      "运行期间本应阻止睡眠：检查是不是合上了笔记本的盖子，或者拔了电源。", "sleep")
 
@@ -502,11 +506,11 @@ class Monitor:
                 pass
         self.started_ms = now_ms()
         # 运行标记还在 = 上次没走到正常停止（崩溃、被强制结束、断电、关机）
-        prev = load_json(self.marker_path)
+        prev = (load_json(self.marker_path) or {}) if self.marker_path.exists() else None
         save_json(self.marker_path, {"pid": os.getpid(), "started_utc": iso_utc(self.started_ms)})
         self.guard.start()
         self.agg.set_down("startup", self._est_now())
-        if prev:
+        if prev is not None:
             log.warning("上次运行（%s 启动）没有正常停止", prev.get("started_utc"))
             last = iso_utc(self.last_start + self.w)[:19] if self.last_start is not None else "-"
             self._notify("已重新启动（上次没有正常停止）",
@@ -535,14 +539,24 @@ class Monitor:
             await asyncio.gather(*tasks, return_exceptions=True)
             self.close()
             self.guard.stop()
-            self._write_health()
-            log.info("监控器停止：%s", reason)
-            await asyncio.to_thread(self.notifier.send, "已停止", reason, None)
-            # 走到这里都算有交代的停止（异常也推送了原因）；只有崩溃、强杀、断电才会留下运行标记
+            try:
+                self._write_health()
+            except OSError as e:
+                log.error("写运行状况失败：%s", e)
+            # 走到这里都算有交代的停止（异常会推送原因）；只有崩溃、强杀、断电才会留下运行标记。
+            # 先删标记再推送：网络慢时推送可能拖过 launchd 的 30 秒停止时限而被强杀
             try:
                 self.marker_path.unlink()
             except FileNotFoundError:
                 pass
+            if reason == "收到停止信号":
+                log.info("监控器停止：%s", reason)
+            else:
+                log.error("监控器停止：%s", reason)
+            try:
+                await asyncio.wait_for(asyncio.to_thread(self.notifier.send, "已停止", reason, None), 15)
+            except asyncio.TimeoutError:
+                log.warning("「已停止」推送超时，没发出去")
             self.unlock()
 
     async def _stop_after(self, s: float) -> None:
@@ -567,10 +581,18 @@ class Monitor:
         self._tasks.add(t)
         t.add_done_callback(self._tasks.discard)
 
+    async def _send_retry(self, title: str, body: str, key: str | None) -> None:
+        """发送失败（多半是网络还没好，例如刚醒来、刚开机）就隔一会儿再试，最多试 5 次。"""
+        for delay in self.notify_retry_s:
+            if delay and await self._sleep(delay):
+                return
+            if await asyncio.to_thread(self.notifier.send, title, body, key) is not False:
+                return
+
     def _notify(self, title: str, body: str, key: str | None) -> None:
         try:
             asyncio.get_running_loop()
         except RuntimeError:
             self.notifier.send(title, body, key)
             return
-        self._spawn(asyncio.to_thread(self.notifier.send, title, body, key))
+        self._spawn(self._send_retry(title, body, key))

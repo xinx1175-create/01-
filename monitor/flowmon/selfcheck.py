@@ -12,12 +12,14 @@ import statistics
 import subprocess
 import sys
 import time
+import zipfile
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from . import macos, power
-from .bucket import iso_utc
+from .bucket import DOWNTIME, iso_utc
 from .config import Config
 from .heartbeat import redact
 from .report import day_disk_usage, dir_size, fmt_bytes
@@ -65,6 +67,57 @@ def monitor_running(cfg: Config) -> bool:
         return False
 
 
+class Rules:
+    """分数引擎（score.ScoreEngine）判定 R、S 能不能算、是否有效的规则，按桶表里的完整性逐桶推演。
+
+    R 算得出来要：本桶、成交方向窗口里的桶、价格窗口起点、持仓量变化窗口起点都完整，且回看范围内
+    至少有两个持仓量变化值（Z 的标准差）。R 有效还要基准值有效：从第一个桶算起记录满 baseline_hours，
+    且回看 baseline_lookback_hours 内的完整桶至少有 n × baseline_min_coverage 个。
+    S 要平滑窗口里的 R 都算得出来（有效则都有效）。缺的行按不完整算；最后一个桶之后假设都完整。
+    rows 要按时间排好、覆盖回看范围。
+    """
+
+    def __init__(self, rows: list[dict], cfg: Config):
+        sc = self.sc = cfg.score
+        self.w = cfg.bucket.width_s * 1000
+        self.n = max(1, round(sc.baseline_hours * 3600 / cfg.bucket.width_s))
+        self.look = max(self.n, round(sc.baseline_lookback_hours * 3600 / cfg.bucket.width_s))
+        self.first = rows[0]["start_ms"]
+        self.last = rows[-1]["start_ms"]
+        self.complete = {r["start_ms"]: bool(r["complete"]) for r in rows}
+        self.done = sorted(t for t, ok in self.complete.items() if ok)
+
+    def ok(self, t: int) -> bool:
+        return t > self.last or self.complete.get(t, False)
+
+    def count(self, t: int) -> int:
+        # 回看范围 (t − look·w, t] 里的完整桶：已有的 + 假设 last 之后的都完整；最多用 n 个
+        lo = t - self.look * self.w
+        have = bisect.bisect_right(self.done, t) - bisect.bisect_right(self.done, lo)
+        return min(self.n, have + max(0, (t - max(self.last, lo)) // self.w))
+
+    def ready(self, t: int) -> bool:
+        return t - (self.n - 1) * self.w >= self.first and self.count(t) >= self.sc.baseline_min_coverage * self.n
+
+    def r_inputs(self, t: int) -> bool:
+        sc, w = self.sc, self.w
+        need = [t - k * w for k in range(sc.flow_window_buckets + 1)] + [t - sc.oi_window_buckets * w]
+        if not all(self.ok(x) for x in need):
+            return False
+        k, x = 0, t
+        while x > t - self.look * w and k < 2:
+            k += self.ok(x) and self.ok(x - sc.oi_window_buckets * w)
+            x -= w
+        return k >= 2
+
+    def s_computable(self, t: int) -> bool:
+        return all(self.r_inputs(t - k * self.w) for k in range(self.sc.smooth_buckets))
+
+    def s_valid(self, t: int) -> bool:
+        return all(self.r_inputs(x) and self.ready(x)
+                   for x in (t - k * self.w for k in range(self.sc.smooth_buckets)))
+
+
 @dataclass
 class Warmup:
     fill: float          # 基准值用的完整桶（回看范围内最近 n 个）够了几成
@@ -74,57 +127,17 @@ class Warmup:
 
 
 def baseline_eta(rows: list[dict], cfg: Config) -> Warmup:
-    """按分数引擎（score.ScoreEngine）的规则往后推演，估算分数什么时候有效。rows 要按时间排好、覆盖回看范围。
-
-    R 有效要：基准值有效（从第一个桶算起记录满 baseline_hours，且回看 baseline_lookback_hours 内的完整桶
-    至少有 n × baseline_min_coverage 个）；本桶、成交方向窗口里的桶、价格窗口起点、持仓量变化窗口起点都完整。
-    S 有效要平滑窗口里的 R 都有效。缺的行按不完整算；最后一个桶之后假设都完整。
-    """
-    sc = cfg.score
-    w = cfg.bucket.width_s * 1000
-    n = max(1, round(sc.baseline_hours * 3600 / cfg.bucket.width_s))
-    look = max(n, round(sc.baseline_lookback_hours * 3600 / cfg.bucket.width_s))
+    """估算分数什么时候有效，规则见 Rules。"""
     if not rows:
         return Warmup(0.0, 0.0, False, None)
-    first = rows[0]["start_ms"]
-    last = rows[-1]["start_ms"]
-    complete = {r["start_ms"]: bool(r["complete"]) for r in rows}
-    done = sorted(t for t, ok in complete.items() if ok)
-
-    def ok(t: int) -> bool:
-        return t > last or complete.get(t, False)
-
-    def count(t: int) -> int:
-        # 回看范围 (t − look·w, t] 里的完整桶：已有的 + 假设 last 之后的都完整；最多用 n 个
-        lo = t - look * w
-        have = bisect.bisect_right(done, t) - bisect.bisect_right(done, lo)
-        return min(n, have + max(0, (t - max(last, lo)) // w))
-
-    def ready(t: int) -> bool:
-        return t - (n - 1) * w >= first and count(t) >= sc.baseline_min_coverage * n
-
-    def doi_ok(t: int) -> bool:
-        # 这个桶能算出持仓量变化：本桶和持仓量变化窗口起点都完整
-        return ok(t) and ok(t - sc.oi_window_buckets * w)
-
-    def r_valid(t: int) -> bool:
-        need = [t - k * w for k in range(sc.flow_window_buckets + 1)] + [t - sc.oi_window_buckets * w]
-        if not (all(ok(x) for x in need) and ready(t)):
-            return False
-        # Z 的标准差至少要两个持仓量变化值（回看范围内）
-        k = 0
-        x = t
-        while x > t - look * w and k < 2:
-            k += doi_ok(x)
-            x -= w
-        return k >= 2
-
-    recent = (bisect.bisect_right(done, last) - bisect.bisect_right(done, last - n * w)) / n
-    out = Warmup(count(last) / n, recent, ready(last), None)
+    ru = Rules(rows, cfg)
+    n, w, last = ru.n, ru.w, ru.last
+    recent = (bisect.bisect_right(ru.done, last) - bisect.bisect_right(ru.done, last - n * w)) / n
+    out = Warmup(ru.count(last) / n, recent, ru.ready(last), None)
     t = last
-    for _ in range(look + n + sc.oi_window_buckets + sc.smooth_buckets + 2):
+    for _ in range(ru.look + n + ru.sc.oi_window_buckets + ru.sc.smooth_buckets + 2):
         t += w
-        if all(r_valid(t - k * w) for k in range(sc.smooth_buckets)):
+        if ru.s_valid(t):
             out.eta = t + w
             break
     return out
@@ -148,7 +161,8 @@ def _f(x, p=2) -> str:
     return "-" if x is None else f"{x:.{p}f}"
 
 
-def run_check(cfg: Config, minutes: float = 60, now_ms: int | None = None) -> tuple[str, bool]:
+def run_check(cfg: Config, minutes: float = 60, now_ms: int | None = None) -> tuple[str, bool, Path | None]:
+    """返回 (报告全文, 是否全部通过, 报告存到了哪里)。"""
     now_ms = now_ms or int(time.time() * 1000)
     w = cfg.bucket.width_s * 1000
     items: list[Item] = []
@@ -179,14 +193,33 @@ def run_check(cfg: Config, minutes: float = 60, now_ms: int | None = None) -> tu
 
     # ---------- 1. 进程 ----------
     running = monitor_running(cfg)
+    started = _parse_iso(health["started_utc"]) if health.get("started_utc") else None
+    # 这段时间里重新启动过：进程启动时刻在窗口里，而且之前已经有数据（不是第一次启动）
+    restarted = (started is not None and started > win_lo + 60_000 and bool(rows)
+                 and rows[0]["start_ms"] < started - 60_000)
     svc = macos.status() if power.is_macos() else None
-    svc_txt = ""
+    svc_txt, crashed = "", False
     if svc is not None:
-        svc_txt = ("；后台服务：" + (f"{svc.get('state', '?')}，启动过 {svc.get('runs', '?')} 次，"
-                                   f"上次退出码 {svc.get('last exit code', '-')}" if svc["loaded"] else "没有安装或没有加载"))
-    items.append(Item("通过" if running else "不通过",
-                      (f"监控器在运行（pid {health.get('pid', '?')}，{health.get('started_utc', '?')} 启动）"
-                       if running else "监控器没在运行") + svc_txt))
+        if svc["loaded"]:
+            code = svc.get("last exit code", "-")
+            sig = svc.get("last terminating signal")
+            svc_txt = (f"；后台服务：{svc.get('state', '?')}，启动过 {svc.get('runs', '?')} 次，上次退出码 {code}"
+                       + (f"（{sig}）" if sig else ""))
+            # 上次退出不是正常的 0，而且就在这段时间里重新启动过：多半是崩溃后被拉起来的
+            crashed = restarted and code not in ("0", "-", "(never exited)")
+        else:
+            svc_txt = "；后台服务：没有安装或没有加载"
+    proc_txt = (f"监控器在运行（pid {health.get('pid', '?')}，{health.get('started_utc', '?')} 启动"
+                + ("，在这段时间里重新启动过" if restarted else "") + "）"
+                if running else "监控器没在运行")
+    items.append(Item("通过" if running and not crashed else "不通过",
+                      proc_txt + svc_txt + ("。上次是异常退出，看下面 launchd.err.log 和日志里的错误" if crashed else "")))
+    err_log = cfg.log_dir / "launchd.err.log"
+    if err_log.exists() and err_log.stat().st_size:
+        tail_lines = err_log.read_text(encoding="utf-8", errors="replace").splitlines()[-20:]
+        detail_tail = ["", "launchd.err.log 最后 20 行（启动失败、未捕获异常写在这里）："] + tail_lines
+    else:
+        detail_tail = []
 
     # ---------- 2. 最新的桶 ----------
     if not rows:
@@ -201,9 +234,15 @@ def run_check(cfg: Config, minutes: float = 60, now_ms: int | None = None) -> tu
         # 应有的桶数从窗口里第一个桶算起：刚启动不到 N 分钟时不要求更早的桶
         expected = max(1, (last["start_ms"] + w - lo) // w)
         n_ok = sum(1 for r in win if r["complete"])
-        pct = n_ok / len(win) * 100
+        # 启动时（等第一份盘口快照）和停机期间的桶本来就不完整，不算进完整率，另外列出
+        why = [set((r["incomplete_reason"] or "").split("|")) for r in win]
+        n_expect_bad = sum(1 for r, x in zip(win, why) if not r["complete"] and x & {"startup", DOWNTIME})
+        base = len(win) - n_expect_bad
+        pct = n_ok / base * 100 if base else 100.0
+        extra = f"；另有启动、停机期间的桶 {n_expect_bad} 个，不计" if n_expect_bad else ""
         items.append(Item("通过" if len(win) >= expected * 0.98 and pct >= 95 else "不通过",
-                          f"最近 {minutes:g} 分钟：{len(win)} / {expected} 个桶，完整 {n_ok} 个（{pct:.1f}%）"))
+                          f"最近 {minutes:g} 分钟：{len(win)} / {expected} 个桶，完整 {n_ok} / {base} 个"
+                          f"（{pct:.1f}%）{extra}"))
         reasons = Counter(x for r in win if not r["complete"] for x in (r["incomplete_reason"] or "").split("|") if x)
         detail.append("不完整原因（一个桶可能有多个）：" + ("，".join(f"{k} {v}" for k, v in reasons.most_common()) or "无"))
     comp = [r for r in win if r["complete"]]
@@ -218,10 +257,13 @@ def run_check(cfg: Config, minutes: float = 60, now_ms: int | None = None) -> tu
         with_book = sum(1 for r in comp if r["bid1"] is not None and r["ask1"] is not None)
         spreads = [r["spread"] for r in comp if r["spread"] is not None]
         trunc = sum(1 for r in comp if r["near_truncated"])
-        items.append(Item("通过" if with_book == len(comp) and not health.get("parse_errors") else "不通过",
+        items.append(Item("通过" if with_book == len(comp) else "不通过",
                           f"盘口：{with_book} / {len(comp)} 个完整桶有买一卖一，价差中位 "
-                          f"{_f(statistics.median(spreads) if spreads else None)}，盘口校验失败 "
-                          f"{health.get('book_errors', '?')} 次，解析失败 {health.get('parse_errors') or 0}"))
+                          f"{_f(statistics.median(spreads) if spreads else None)}"))
+        pe = health.get("parse_errors") or {}
+        detail.append(f"这次启动以来：盘口校验失败 {health.get('book_errors', '?')} 次，推送解析失败 "
+                      + ("，".join(f"{k} {v} 次" for k, v in pe.items()) if pe else "0 次")
+                      + "（最近 N 分钟里的解析失败会作为错误出现在「日志」一项）")
         detail.append(f"近处挂单没铺满（near_truncated=1）：{trunc} / {len(comp)} 个桶（README「还没定的」第 1 条要看这个）")
     misc_days = sorted({_day(lo), _day(now_ms)})
     misc = [m for m in read_jsonl(day_files(cfg.data_dir / "raw" / "misc", misc_days, ".jsonl"))
@@ -236,10 +278,11 @@ def run_check(cfg: Config, minutes: float = 60, now_ms: int | None = None) -> tu
                   f"强平 {kinds['liq']}，连接事件 {kinds['conn']}，睡眠 {kinds['sleep']}")
 
     # ---------- 5. 分数 ----------
-    started = _parse_iso(health["started_utc"]) if health.get("started_utc") else rows[0]["start_ms"]
-    run_min = (now_ms - started) / 60_000
+    run_min = (now_ms - (started or rows[0]["start_ms"])) / 60_000
     has = {k: sum(1 for r in comp if r[k] is not None) for k in ("F", "M", "A", "Z", "R", "S")}
-    tail = [r for r in comp if r["start_ms"] >= last["start_ms"] - 10 * 60_000]
+    # 最近 10 分钟里，按引擎的规则应该算得出 S 的桶（数据窗口都完整）：它们都要真的算出了 S
+    ru = Rules(rows, cfg)
+    tail = [r for r in comp if r["start_ms"] >= last["start_ms"] - 10 * 60_000 and ru.s_computable(r["start_ms"])]
     s_tail = sum(1 for r in tail if r["S"] is not None)
     valid = sum(1 for r in win if r["score_valid"])
     wu = baseline_eta(rows, cfg)
@@ -253,11 +296,12 @@ def run_check(cfg: Config, minutes: float = 60, now_ms: int | None = None) -> tu
         valid_txt = (f"有效分数 {valid} 个（预热中，基准值够了 {wu.fill:.0%}；"
                      f"之后数据都完整的话最早 {eta_txt} 有效）")
     seen = "，".join(f"{k} {v}" for k, v in has.items())
-    if run_min < 10:
-        items.append(Item("等待", f"分数：刚启动 {run_min:.0f} 分钟，S 要 7 分钟左右才开始有数（各项已算出：{seen}）"))
+    if not tail:
+        items.append(Item("等待", f"分数：最近 10 分钟的数据窗口还没填满（刚启动约 {run_min:.0f} 分钟，或刚断过线），"
+                                  f"S 要连续 6 分钟左右完整的数据才算得出来（各项已算出：{seen}）"))
     else:
-        items.append(Item("通过" if tail and s_tail >= len(tail) * 0.9 else "不通过",
-                          f"分数在计算：最近 10 分钟 {s_tail} / {len(tail)} 个完整桶算出了 S；{valid_txt}"))
+        items.append(Item("通过" if s_tail == len(tail) else "不通过",
+                          f"分数在计算：最近 10 分钟数据窗口完整的 {len(tail)} 个桶，{s_tail} 个算出了 S；{valid_txt}"))
     detail.append(f"各项算出的桶数（最近 {minutes:g} 分钟的完整桶 {len(comp)} 个）：{seen}")
     s_vals = [r["S"] for r in comp if r["S"] is not None]
     if s_vals:
@@ -288,16 +332,17 @@ def run_check(cfg: Config, minutes: float = 60, now_ms: int | None = None) -> tu
     # ---------- 8. 睡眠 ----------
     pw = health.get("power") or {}
     sleeps = health.get("sleeps") or []
+    n_sleep = kinds["sleep"]  # 这段时间里的睡眠（raw/misc 里的记录）
+    sleep_txt = f"这段时间睡眠过 {n_sleep} 次（这次启动以来 {len(sleeps)} 次）"
     if power.is_macos():
         asserts = power.sleep_assertions()
-        ok = bool(asserts) and pw.get("caffeinate_running") and not sleeps
+        ok = bool(asserts) and pw.get("caffeinate_running") and not n_sleep
         items.append(Item("通过" if ok else "不通过",
                           f"阻止睡眠：caffeinate {'在运行' if pw.get('caffeinate_running') else '没在运行'}，"
-                          f"系统里 {len(asserts)} 条相关断言，供电 {power.power_source() or '?'}，"
-                          f"睡眠过 {len(sleeps)} 次"))
+                          f"系统里 {len(asserts)} 条相关断言，供电 {power.power_source() or '?'}，{sleep_txt}"))
         detail += [f"  {a}" for a in asserts]
     else:
-        items.append(Item("跳过", f"阻止睡眠：不是 macOS（{osname}）；睡眠过 {len(sleeps)} 次"))
+        items.append(Item("跳过" if not n_sleep else "不通过", f"阻止睡眠：不是 macOS（{osname}）；{sleep_txt}"))
     for s in sleeps[-5:]:
         detail.append(f"睡眠：{s['from_utc']} → {s['to_utc']}，{s['seconds']} 秒")
 
@@ -333,6 +378,7 @@ def run_check(cfg: Config, minutes: float = 60, now_ms: int | None = None) -> tu
                       f"{_f(r['latency_ms'], 0):>5} {r['incomplete_reason'] or r['score_note'] or ''}")
     if errs or warns:
         detail += ["", "日志里最近的警告和错误（最多 20 条）："] + [ln[:300] for ln in (errs + warns)[-20:]]
+    detail += detail_tail
     return _render(cfg, head, items, detail, now_ms)
 
 
@@ -340,7 +386,8 @@ def _parse_iso(s: str) -> int:
     return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() * 1000)
 
 
-def _render(cfg: Config, head: list[str], items: list[Item], detail: list[str], now_ms: int) -> tuple[str, bool]:
+def _render(cfg: Config, head: list[str], items: list[Item], detail: list[str],
+            now_ms: int) -> tuple[str, bool, Path | None]:
     ok = all(i.status in ("通过", "提示", "跳过", "等待") for i in items)
     n_bad = sum(1 for i in items if i.status == "不通过")
     lines = head + ["", "== 结论 ==", "全部通过" if ok else f"有 {n_bad} 项不通过", ""]
@@ -354,5 +401,31 @@ def _render(cfg: Config, head: list[str], items: list[Item], detail: list[str], 
         text += f"\n已保存到 {out}\n"
     except OSError as e:
         print(f"保存自检结果失败：{e}", file=sys.stderr)
-    return text, ok
+        out = None
+    return text, ok, out
+
+
+def write_bundle(cfg: Config, check_file: Path | None, now_ms: int, minutes: float) -> Path:
+    """把要发回来核对的文件打成一个压缩包，放在配置文件所在目录（~/flowmon）：
+    自检结果、这段时间涉及的每一天的日志和桶表（跨过 UTC 零点时两天都带上）、后台服务的输出。
+    不带配置文件（里面有心跳地址和通知主题）。"""
+    lo = now_ms - int(minutes * 60_000)
+    days = sorted({_day(lo), _day(now_ms)})
+    files: list[tuple[Path, str]] = []
+    if check_file is not None:
+        files.append((check_file, check_file.name))
+    for d in days:
+        files.append((cfg.log_dir / f"{LOG_NAME}.{d}", f"logs/{LOG_NAME}.{d}"))
+    files.append((cfg.log_dir / LOG_NAME, f"logs/{LOG_NAME}"))
+    for name in ("launchd.err.log", "launchd.out.log"):
+        files.append((cfg.log_dir / name, f"logs/{name}"))
+    for p in day_files(cfg.data_dir / "buckets", days, ".csv"):
+        files.append((p, f"buckets/{p.name}"))
+    stamp = iso_utc(now_ms)[:16].replace("-", "").replace(":", "")
+    out = cfg.base_dir / f"flowmon-check-{stamp}Z.zip"
+    with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+        for p, arc in files:
+            if p.exists():
+                z.write(p, arc)
+    return out
 

@@ -15,11 +15,17 @@ from __future__ import annotations
 
 import csv
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Iterable, Iterator
 
 TRADE_COLUMNS = ["ts", "recv", "trade_id", "px", "sz", "side", "count"]
+
+log = logging.getLogger(__name__)
+
+# 两张表各自的时间列（桶表 start_ms、事件表 ts_ms）：读回时没有时间的行跳过，各处按它排序
+KEY_COLUMNS = ("start_ms", "ts_ms")
 
 
 def fmt(v) -> str:
@@ -72,10 +78,17 @@ class DailyCsv:
                 new = False
                 break
             n += 1
+        if not new:
+            # 上次崩溃或断电时可能只写了半行：先补一个换行，免得新的行接在半行后面、两行一起坏掉
+            with p.open("rb") as f:
+                f.seek(-1, os.SEEK_END)
+                torn = f.read(1) != b"\n"
         self.f = p.open("a", encoding="utf-8", newline="")
         self.w = csv.writer(self.f)
         if new:
             self.w.writerow(self.columns)
+        elif torn:
+            self.f.write("\r\n")
         self.day = day
 
     def write(self, day: str, row: dict) -> None:
@@ -127,13 +140,25 @@ def day_files(directory: Path, days: Iterable[str], ext: str) -> list[Path]:
 
 
 def read_csv(paths: Iterable[Path], types: dict[str, type] | None = None) -> Iterator[dict]:
+    """逐行读。列数和表头对不上、或者数字解析不了的行跳过：那是崩溃、断电时只写了一半的行。"""
     for p in paths:
-        with p.open(encoding="utf-8", newline="") as f:
-            for row in csv.DictReader(f):
-                if types:
-                    yield {k: parse(v, types.get(k, str)) for k, v in row.items()}
-                else:
+        with p.open(encoding="utf-8", newline="", errors="replace") as f:
+            for i, row in enumerate(csv.DictReader(f)):
+                if None in row or None in row.values():
+                    log.warning("%s 第 %d 行列数不对（崩溃时写了半行？），跳过", p, i + 2)
+                    continue
+                if not types:
                     yield row
+                    continue
+                try:
+                    out = {k: parse(v, types.get(k, str)) for k, v in row.items()}
+                except ValueError:
+                    log.warning("%s 第 %d 行解析不了（崩溃时写了半行？），跳过", p, i + 2)
+                    continue
+                if any(k in out and out[k] is None for k in KEY_COLUMNS):
+                    log.warning("%s 第 %d 行没有时间，跳过", p, i + 2)
+                    continue
+                yield out
 
 
 def read_jsonl(paths: Iterable[Path]) -> Iterator[dict]:
@@ -157,7 +182,11 @@ def save_json(path: Path, obj) -> None:
 
 
 def load_json(path: Path):
+    """读不到返回 None。文件坏了（断电时没写完）也返回 None，记一条警告，不让它挡住启动。"""
     try:
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
+        return None
+    except (ValueError, OSError) as e:
+        log.warning("%s 读不了（%s），当作没有", path, e)
         return None

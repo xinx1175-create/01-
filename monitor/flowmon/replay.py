@@ -72,23 +72,25 @@ class Replayer:
         self.ct = contract_size(meta["instrument"])
         self.w = cfg.bucket.width_s * 1000
 
-    def warm_up(self, score: ScoreEngine, cond: Conditions, day_from: str) -> int:
-        """回放范围之前最近 restore_days 天的实时桶喂给分数和不交易条件，返回用了多少个桶。"""
+    def warm_up(self, score: ScoreEngine, cond: Conditions, day_from: str) -> tuple[int, float | None]:
+        """回放范围之前的实时桶喂给分数和不交易条件，读的天数和实时重启时 restore() 一样。
+        返回 (用了多少个桶, 最后一个收盘)：回放第一个桶没有成交时，价格沿用它，和实时一样。"""
         cfg = self.cfg
         bdir = self.src / "buckets"
         days = sorted({p.name[:10] for p in bdir.glob("*.csv") if p.name[:10] < day_from})
-        days = days[-cfg.storage.restore_days:]
-        rows = sorted(read_csv(day_files(bdir, days, ".csv"), dict(bucket_columns(cfg))),
-                      key=lambda r: r["start_ms"])
-        n, last = 0, None
+        days = days[-(cfg.storage.restore_days + 1):]
+        rows = sorted(read_csv(day_files(bdir, days, ".csv"), dict(bucket_columns(cfg))), key=lambda r: r["start_ms"])
+        n, last, close = 0, None, None
         for r in rows:
             if r["width_s"] != cfg.bucket.width_s or (last is not None and r["start_ms"] <= last):
                 continue
             sc = score.update(r)
             cond.update(r, sc.valid, sc.S)
             last = r["start_ms"]
+            if r["close"] is not None:
+                close = r["close"]
             n += 1
-        return n
+        return n, close
 
     def run(self, day_from: str, day_to: str) -> dict:
         cfg, w = self.cfg, self.w
@@ -116,9 +118,8 @@ class Replayer:
         ev_cols = [n for n, _ in event_columns(cfg)]
         w_b = DailyCsv(self.out / "buckets", [n for n, _ in bucket_columns(cfg)])
         w_e = DailyCsv(self.out / "events", ev_cols)
-        stats = {"buckets": 0, "skipped": 0, "events": 0, "trades": 0,
-                 "warmup": self.warm_up(score, cond, day_from)}
-        prev_close = None
+        n_warm, prev_close = self.warm_up(score, cond, day_from)
+        stats = {"buckets": 0, "skipped": 0, "events": 0, "trades": 0, "warmup": n_warm}
         li = 0
 
         def coverage(s: int, e: int) -> tuple[bool, set[str]] | None:
@@ -166,8 +167,9 @@ class Replayer:
                 stats["skipped"] += 1
                 return
             ok, why = cov
-            if why == {DOWNTIME} and b.trade_msgs == 0:
-                # 实时停机期间补写的占位桶：和实时一样没有价格，也不更新「上一个收盘」
+            if why == {DOWNTIME}:
+                # 实时停机期间补写的占位桶：和实时一样没有价格，也不更新「上一个收盘」。
+                # 停机那一刻没封的桶也在这里：原始数据里有它的部分成交，但实时没封它，回放也不用
                 b.capture = None
                 row = downtime_row(s, w)
             else:

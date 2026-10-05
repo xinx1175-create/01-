@@ -28,17 +28,17 @@ class Notifier:
         self.prefix = prefix
         self._last: dict[str, float] = {}
 
-    def send(self, title: str, body: str, key: str | None = None) -> bool:
-        """同步发送。key 不为空时按 min_interval_s 限频，同类告警不刷屏。"""
+    def send(self, title: str, body: str, key: str | None = None) -> bool | None:
+        """同步发送。成功 True，发送失败 False，没启用或被限频 None。
+
+        key 不为空时按 min_interval_s 限频，同类告警不刷屏；发送失败不算数，下次照样能发。"""
         if self.cfg.kind == "none":
             log.info("[通知未启用] %s：%s", title, body)
-            return False
+            return None
         if key is not None:
-            t = time.monotonic()
             last = self._last.get(key)
-            if last is not None and t - last < self.cfg.min_interval_s:
-                return False
-            self._last[key] = t
+            if last is not None and time.monotonic() - last < self.cfg.min_interval_s:
+                return None
         title = f"{self.prefix} {title}"
         try:
             if self.cfg.kind == "ntfy":
@@ -58,6 +58,8 @@ class Notifier:
             with urllib.request.urlopen(req, timeout=_TIMEOUT_S) as r:
                 r.read()
             log.info("已推送：%s", title)
+            if key is not None:
+                self._last[key] = time.monotonic()
             return True
         except Exception as e:
             log.error("推送失败（%s）：%s", self.cfg.kind, e)

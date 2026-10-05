@@ -12,10 +12,10 @@
 | --- | --- |
 | 源代码 | `flowmon/`，按 数据接入 / 数据桶 / 分数 / 不交易条件 / 事件 / 存储 分模块 |
 | 配置文件样例 | `config.example.toml`，对应 §13，代码里没有任何默认值 |
-| 单元测试 | `tests/`，244 个测试用例（其中 150 个是随机历史上的估算核对，3 个接本地假交易所端到端），全部通过 |
+| 单元测试 | `tests/`，256 个测试用例（其中 150 个是随机历史上的估算核对，3 个接本地假交易所端到端），全部通过 |
 | 阶段一判定工具 | `python -m flowmon evaluate`，按已定口径判定 §11 阶段一是否通过，见「阶段一判定」 |
 | 说明文件 | 本文件 |
-| 至少 1 小时的实际运行记录 | 由你在自己的 Mac 上开始正式记录，启动一小时后运行 `flowmon check`，把自检结果、日志和当天的桶表发回来核对，步骤见 [docs/macos-setup.md](docs/macos-setup.md) 第 11 步。开发环境连不上 OKX，之前用本地假交易所跑过 39.6 小时模拟时长的连续运行，见 [docs/sim-run.md](docs/sim-run.md) |
+| 至少 1 小时的实际运行记录 | 由你在自己的 Mac 上开始正式记录，启动一小时后运行 `flowmon check --bundle`，把打好的压缩包（自检结果、日志、这一小时的桶表）发回来核对，步骤见 [docs/macos-setup.md](docs/macos-setup.md) 第 11 步。开发环境连不上 OKX，之前用本地假交易所跑过 39.6 小时模拟时长的连续运行，见 [docs/sim-run.md](docs/sim-run.md) |
 | 在自己的电脑上长期运行 | macOS 后台服务（登录后自动启动、崩溃后自动拉起）、运行期间阻止睡眠、重启后接着用存下的数据、停机期间的桶标为不完整、日报列出当天数据占用的磁盘、每分钟向心跳服务报到，见「在 Mac 上长期运行」 |
 | 对照官方文档核对 §4 | 官方文档站同样被拦截，只能通过搜索结果和二手资料核对。已核对和待核对的项见「与 OKX 官方文档的核对」 |
 
@@ -23,15 +23,17 @@
 
 在 Mac 上正式运行按 [docs/macos-setup.md](docs/macos-setup.md) 做。下面是开发、跑测试用的最简步骤。
 
-需要 Python 3.11 或更高版本（配置用标准库 `tomllib` 读取）。运行时只依赖 `websockets`。
+需要 Python 3.11 或更高版本（配置用标准库 `tomllib` 读取）。运行时只依赖 `websockets`（15 以上，会自动用系统代理）和 `python-socks`（系统代理是 SOCKS 时要用）。
 
 ```bash
 cd monitor
 python3 -m venv venv && . venv/bin/activate
-pip install -r requirements.txt          # 跑测试再加：pip install -r requirements-dev.txt
+pip install -r requirements.txt
 cp config.example.toml config.toml
-cp calendar.example.csv calendar.csv     # 经济数据日程，手工维护
+cp calendar.example.csv calendar.csv
 ```
+
+跑测试再装 `requirements-dev.txt`。`calendar.csv` 是经济数据日程，手工维护。
 
 电脑要开自动对时（Mac：系统设置 → 通用 → 日期与时间 → 自动设置）。数据延迟 = 本地接收时间 − 交易所时间戳，本机时钟偏了，延迟就不准。
 
@@ -76,9 +78,10 @@ cp calendar.example.csv calendar.csv     # 经济数据日程，手工维护
 ## 启动
 
 ```bash
-python -m flowmon run --config config.toml                  # 一直运行，Ctrl-C 或 SIGTERM 正常停止
-python -m flowmon run --config config.toml --duration 3600  # 跑 1 小时自动停
+python -m flowmon run --config config.toml
 ```
+
+一直运行，Ctrl-C 或 SIGTERM 正常停止；加 `--duration 3600` 跑 1 小时自动停。
 
 同一个数据目录只允许一个监控器在写（`data/state/run.lock`）。后台服务在跑时再手动启动一个，会提示「另一个监控器正在写数据目录」并退出，不会把数据写乱。
 
@@ -92,12 +95,17 @@ python -m flowmon run --config config.toml --duration 3600  # 跑 1 小时自动
 ### 开机登录后自动启动、崩溃后自动拉起
 
 ```bash
-python -m flowmon service install --config ~/flowmon/config.toml   # 写服务定义并启动
-python -m flowmon service status  --config ~/flowmon/config.toml   # state、pid、启动过几次、上次退出码
-python -m flowmon service restart --config ~/flowmon/config.toml   # 更新代码后用：先正常停止再启动
-python -m flowmon service stop|start|uninstall --config ~/flowmon/config.toml
-python -m flowmon service print   --config ~/flowmon/config.toml   # 只打印服务定义，不安装（任何系统都能用）
+python -m flowmon service install --config ~/flowmon/config.toml
 ```
+
+| 动作 | 作用 |
+| --- | --- |
+| `install` | 写服务定义并启动；终端里设了 `https_proxy` 之类的代理变量，会一并写进服务 |
+| `status` | state、pid、启动过几次、上次退出码 |
+| `restart` | 更新代码后用：先正常停止再启动 |
+| `stop` / `start` | 停止（下次登录还会自动启动）/ 启动 |
+| `uninstall` | 停止并删掉服务定义 |
+| `print` | 只打印服务定义，不安装（任何系统都能用） |
 
 服务定义写在 `~/Library/LaunchAgents/com.flowmon.monitor.plist`（launchd 用户级服务）：`RunAtLoad` 登录后自动启动，`KeepAlive` 不管因为什么退出都再拉起来（最快 10 秒一次），停止时先发 SIGTERM，监控器落盘、保存状态后退出，30 秒还没退才强杀。日志只写 `logs/flowmon.log`（`--no-console-log`），`logs/launchd.err.log` 只接启动失败、未捕获异常这类输出。
 
@@ -140,12 +148,14 @@ python -m flowmon service print   --config ~/flowmon/config.toml   # 只打印�
 ### 自检
 
 ```bash
-python -m flowmon check --config ~/flowmon/config.toml        # 默认看最近 60 分钟，--minutes 改
+python -m flowmon check --config ~/flowmon/config.toml --bundle
 ```
 
-只读数据，不影响正在运行的监控器。逐项给出通过与否：监控器在运行（进程锁和后台服务状态）、最新的桶多久前结束、桶数和完整率、成交、盘口、持仓量推送频率、分数各项（F、M、A、Z、R、S）是否在计算以及预计何时有效、数据延迟、日志里的错误和警告、阻止睡眠是否生效（`pmset -g assertions`）、供电方式、睡眠记录、心跳最近一次成功；再附上不完整原因、分数无效原因、近处挂单没铺满的比例、各类原始推送条数、磁盘占用、最近 20 个桶。结果同时存到 `data/reports/check-<时间>.txt`。
+默认看最近 60 分钟（`--minutes` 改）。`--bundle` 另外把要发回来的文件打成一个压缩包放在配置文件所在目录：自检结果、这段时间涉及的每一天（跨过 UTC 零点时两天都带上）的日志和桶表、后台服务的输出；不带配置文件。
 
-启动一小时后把这个文件、`logs/flowmon.log` 和当天的桶表发回来，用来确认真实数据在正常写入、分数在正常计算，顺便核对「与 OKX 官方文档的核对」里标「待确认」的几项（解析错误为 0 说明字段名对得上；持仓量推送约 3 秒一条）。
+只读数据，不影响正在运行的监控器。逐项给出通过与否：监控器在运行（进程锁和后台服务状态；这段时间里重新启动过、而上次退出码不是 0，判为崩溃后被拉起，不通过）、最新的桶多久前结束、桶数和完整率（启动时和停机期间的桶本来就不完整，不计入）、成交、盘口、持仓量推送频率、分数是否在计算（按分数引擎的规则，数据窗口都完整的桶必须都算出了 S）以及预计何时有效、数据延迟、日志里的错误和警告、阻止睡眠是否生效（`pmset -g assertions`）、供电方式、这段时间的睡眠记录、心跳最近一次成功；再附上不完整原因、分数无效原因、近处挂单没铺满的比例、各类原始推送条数、这次启动以来的解析失败、磁盘占用、最近 20 个桶、`launchd.err.log` 的最后 20 行。结果同时存到 `data/reports/check-<时间>.txt`。
+
+启动一小时后用 `--bundle` 打包发回来，用来确认真实数据在正常写入、分数在正常计算，顺便核对「与 OKX 官方文档的核对」里标「待确认」的几项（解析错误为 0 说明字段名对得上；持仓量推送约 3 秒一条）。
 
 ### 正式记录的时间线
 
@@ -156,10 +166,12 @@ python -m flowmon check --config ~/flowmon/config.toml        # 默认看最近 
 ## 查看数据
 
 ```bash
-python -m flowmon status --config config.toml          # 最近 20 个桶、当天事件数、正在跟踪的事件
-python -m flowmon check  --config config.toml          # 自检，见上
-python -m flowmon report --config config.toml --date 2026-10-05   # 某天日报
+python -m flowmon status --config config.toml
+python -m flowmon check --config config.toml
+python -m flowmon report --config config.toml --date 2026-10-05
 ```
+
+依次是：最近 20 个桶、当天事件数和正在跟踪的事件；自检（见上）；某天的日报。
 
 文件都按交易所时间（UTC）分天：
 
@@ -241,8 +253,10 @@ ret5 = (e.px_300s / e.price - 1) * e.direction * 100   # 信号后 5 分钟同�
 §11 要求标准在看到结果之前定好，下面这套口径已经定死，写在配置 `[evaluation]` 里，事后不改。
 
 ```bash
-python -m flowmon evaluate --config config.toml --write     # 结果写到 data/reports/evaluation.md
+python -m flowmon evaluate --config config.toml --write
 ```
+
+结果同时写到 `data/reports/evaluation.md`。
 
 **三条同时满足才算通过：**
 
@@ -292,9 +306,10 @@ results = score_series(rows, cfg.score, cfg.bucket.width_s)  # rows 要有 start
 
 不连 OKX，用合成行情把整条链路跑一遍。合成行情只用来验证链路，不能用来评价策略。
 
+先另复制一份配置 `sim.toml`，把 `ws_public_url` 改成 `ws://127.0.0.1:18765`、`rest_base_url` 改成 `http://127.0.0.1:18766`，再运行：
+
 ```bash
 python -m flowmon sim --speed 60 --fault 1500:seq_gap --fault 2400:disconnect &
-# 另复制一份配置，把 ws_public_url 改成 ws://127.0.0.1:18765、rest_base_url 改成 http://127.0.0.1:18766
 python -m flowmon run --config sim.toml --duration 300
 ```
 
@@ -320,6 +335,8 @@ python -m pytest -q tests
 - `test_score.py` 另有：停机后重启接着用停机前的基准值（回看 48 小时时几分钟就有效、严格 24 小时时要等）；朴素实现按两种回看范围各比对一遍。
 - `test_local_run.py`：重启补占位桶（价格留空、misc 有记录、跨天补日报、最多补 7 天）；时钟跳变判为睡眠、标桶、强制重连，接假交易所确认醒来后重连并恢复完整；心跳只在有数据时报到、失败计数、地址打码；进程锁挡住第二个监控器；上次没正常停止时推送提醒、正常停止后删掉运行标记。
 - `test_macos.py`：launchd 服务定义的内容；安装、状态、重启、重装、停止、启动、卸载的命令顺序（launchctl 用假的）；虚拟环境里的 python 路径不被解析掉；caffeinate 的参数、意外退出后重新挂上；供电方式解析和推送。
+- `test_report_check.py` 另有复核发现的自检误判：刚启动时的 startup 桶不算不完整、一次短暂断线不判分数不通过、别的频道的解析失败不算到盘口上、崩溃后被拉起判不通过并附上 launchd.err.log、连接和睡眠记录计数、打包跨过 UTC 零点时两天的文件都带上。
+- `test_local_run.py` 另有：半行（断电时没写完）不挡重启、之后的行不接在半行后面；运行标记写坏了照样当作上次没正常停止；推送失败不占限频额度、网络没好时自动重试；「已停止」推送前已经删掉运行标记。
 - `test_report_check.py`：日报的磁盘占用和停机时长；分数最早有效时刻的估算（首次启动、停机 3/10/28 小时、36 小时、严格 24 小时），并在 150 段随机历史（零星不完整、成段停机、缺行）上和分数引擎逐一核对、要求完全一致；自检在模拟的第一小时数据上逐项给出预期结论、数据过期和心跳失败时报不通过、心跳地址不外泄。
 
 ## 与 OKX 官方文档的核对（§4、§14）
@@ -365,6 +382,8 @@ python -m pytest -q tests
 21. **睡眠检测**：系统时钟比进程计时多走了 `power.sleep_detect_s`（10）秒以上就认定睡眠过。进程计时用 `time.monotonic()`，macOS 和 Linux 上睡眠期间都不走。对时把系统时钟往前拨 10 秒以上也会被当成睡眠，结果只是多标几个不完整的桶、多重连一次。
 22. **心跳报到**：只在最近 `heartbeat.max_data_age_s` 秒内有完整的桶时报到，没数据时不报到也不主动报失败，交给心跳服务的宽限期判断，免得家里网络闪断一下就报警。
 23. **进程锁**：`data/state/run.lock` 上的 `flock`，进程退出（包括崩溃）时系统自动释放。
+24. **写了一半的行**：断电或强杀时 CSV 最后一行可能只写了一半。读回时列数不对、数字解析不了、没有时间的行跳过并记一条警告；往已有文件追加前，如果文件不是以换行结尾，先补一个换行，免得新行接在半行后面。状态文件（JSON）读不了时当作没有，不挡启动。
+25. **推送失败重试**：发送失败（多半是网络还没好，例如刚开机、刚醒来）隔 10、30、60、120 秒再试，最多 5 次；失败不占同类告警的限频额度。停止时先删运行标记再推送「已停止」，推送最多等 15 秒，免得网络慢拖过 launchd 的停止时限被强杀、下次误报「上次没有正常停止」。异常导致的停止在日志里记为错误。
 
 ## 已定的口径
 

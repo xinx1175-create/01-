@@ -80,6 +80,12 @@ def test_live_restart_replay_consistency(tmp_path):
     assert cmp["buckets_common"] == len(rows)
     assert cmp["score_mismatch"] == 0, cmp
     assert cmp["events_only_live"] == [], cmp
+    # 停机那一刻没封的桶（原始数据里有它的部分成交）：实时是空的占位桶，回放也要是
+    rep = {}
+    for p in sorted((out / "buckets").glob("*.csv")):
+        rep.update({r["start_ms"]: r for r in csv.DictReader(p.open())})
+    for r in down:
+        assert rep[r["start_ms"]]["incomplete_reason"] == "downtime" and rep[r["start_ms"]]["close"] == "", r
 
 
 def test_replay_from_second_day_matches_live(tmp_path):
@@ -123,8 +129,16 @@ def test_replay_from_second_day_matches_live(tmp_path):
     day2 = days[1]
 
     out = tmp_path / "replay"
-    stats = Replayer(cfg, data, out).run(day2, day2)
+    r0 = Replayer(cfg, data, out)
+    stats = r0.run(day2, day2)
     assert stats["warmup"] > 0
+    # 预热时带上最后一个收盘：回放第一个桶没有成交时价格和实时一样沿用它
+    from flowmon.score import ScoreEngine
+    from flowmon.conditions import Calendar, Conditions
+    c = cfg.conditions
+    _, close = r0.warm_up(ScoreEngine(cfg.score, 15), Conditions(c, 15, Calendar(None, 0, 0)), day2)
+    day1_rows = list(csv.DictReader((data / "buckets" / f"{days[0]}.csv").open()))
+    assert close == float([x["close"] for x in day1_rows if x["close"]][-1])
     cmp = compare(cfg, data, out, [day2])
     assert cmp["buckets_common"] == cmp["buckets_live"] > 0
     assert cmp["score_mismatch"] == 0, cmp
@@ -132,6 +146,6 @@ def test_replay_from_second_day_matches_live(tmp_path):
     # 不预热就对不上：确认这个测试确实测到了预热
     cold = tmp_path / "replay_cold"
     r = Replayer(cfg, data, cold)
-    r.warm_up = lambda *a: 0
+    r.warm_up = lambda *a: (0, None)
     r.run(day2, day2)
     assert compare(cfg, data, cold, [day2])["score_mismatch"] > 0

@@ -137,15 +137,15 @@ def _first_hour(tmp_path, **cfg_kw):
 def test_check_first_hour(tmp_path):
     cfg, end = _first_hour(tmp_path)
     now = end + 5_000
-    text, ok = run_check(cfg, 60, now_ms=now)
+    text, ok, path = run_check(cfg, 60, now_ms=now)
     assert not ok  # 没有进程锁 = 监控器没在运行
     assert "[不通过] 监控器没在运行" in text
     assert "[通过] 最新的桶 2026-09-30T00:49:45，5 秒前结束" in text
-    assert "[通过] 最近 60 分钟：240 / 240 个桶，完整 240 个（100.0%）" in text
+    assert "[通过] 最近 60 分钟：240 / 240 个桶，完整 240 / 240 个（100.0%）" in text
     assert "[通过] 成交：240 / 240 个完整桶有成交" in text
     assert "[通过] 盘口：240 / 240 个完整桶有买一卖一" in text
     assert "[通过] 持仓量：1200 条推送（约每 3.0 秒一条）" in text
-    assert "[通过] 分数在计算：最近 10 分钟 41 / 41 个完整桶算出了 S" in text
+    assert "[通过] 分数在计算：最近 10 分钟数据窗口完整的 41 个桶，41 个算出了 S" in text
     n = 24 * H // W
     eta = T0 + (n - 1) * W + 4 * W
     assert f"预热中，基准值够了 5%；之后数据都完整的话最早 {iso_utc(eta)[:16]}Z 有效" in text
@@ -156,7 +156,7 @@ def test_check_first_hour(tmp_path):
     assert "secret" not in text and "https://hc-ping.com/…" in text
     assert "S 范围" in text and "最近 20 个桶" in text
     saved = sorted((cfg.data_dir / "reports").glob("check-*.txt"))
-    assert len(saved) == 1 and saved[0].read_text(encoding="utf-8").startswith("flowmon 自检")
+    assert saved == [path] and path.read_text(encoding="utf-8").startswith("flowmon 自检")
 
 
 def test_check_flags_stale_data_and_missing_heartbeat(tmp_path):
@@ -166,7 +166,7 @@ def test_check_flags_stale_data_and_missing_heartbeat(tmp_path):
     st["heartbeat"]["last_ok_utc"] = None
     st["heartbeat"]["last_err"] = "URLError: timed out"
     h.write_text(json.dumps(st), encoding="utf-8")
-    text, ok = run_check(cfg, 60, now_ms=end + 300_000)
+    text, ok, _ = run_check(cfg, 60, now_ms=end + 300_000)
     assert "[不通过] 最新的桶" in text and "300 秒前结束" in text
     assert "[不通过] 心跳：还没有报到成功过；最近一次失败：URLError: timed out" in text
 
@@ -245,3 +245,115 @@ def test_eta_is_exact_on_random_histories(cfg_factory, seed):
     res = score_series(rows + future, cfg.score, 15)
     got = next((r["start_ms"] + W for r, x in zip(rows + future, res) if r["start_ms"] > last and x.valid), None)
     assert eta == got
+
+
+# ---------- 复核发现的自检误判 ----------
+
+def _rows_cfg(tmp_path, n, broken=(), first_reason=None, **cfg_kw):
+    """n 个桶从 T0 开始；broken 里的序号设成不完整（stale）；first_reason 设第 0 个桶的不完整原因。"""
+    cfg = make_cfg(tmp_path, **cfg_kw)
+    m = Monitor(cfg, instrument())
+    for i in range(n):
+        row, b = live_row(T0 + i * W, i)
+        if i in broken:
+            b2 = row.copy()
+            row = {**b2, "complete": False, "incomplete_reason": "stale"}
+        if i == 0 and first_reason:
+            row = {**row, "complete": False, "incomplete_reason": first_reason}
+        m._on_bucket(row, b)
+        for k in range(5):
+            ts = T0 + i * W + k * 3000
+            m._misc(ts, {"type": "oi", "ts": ts, "oi": "5000"})
+    m.started_ms = T0
+    m.hb["last_ok_ms"] = T0 + n * W - 10_000
+    m._write_health()
+    m.close()
+    return cfg, m, T0 + n * W
+
+
+def _item(text, key):
+    return next(ln for ln in text.splitlines() if ln.startswith("[") and key in ln)
+
+
+def test_check_right_after_start(tmp_path):
+    cfg, _, end = _rows_cfg(tmp_path, 12, first_reason="startup|oi_missing|no_book")
+    text, _, _ = run_check(cfg, 60, now_ms=end + 3000)
+    assert _item(text, "个桶，完整").startswith("[通过]")  # 启动那个桶不算
+    assert "另有启动、停机期间的桶 1 个，不计" in text
+    assert _item(text, "分数").startswith("[等待]")
+
+
+def test_check_tolerates_one_transient_gap(tmp_path):
+    cfg, _, end = _rows_cfg(tmp_path, 280, broken={280 - 32})  # 8 分钟前断了一个桶
+    text, _, _ = run_check(cfg, 60, now_ms=end + 3000)
+    assert _item(text, "分数在计算").startswith("[通过]"), _item(text, "分数在计算")
+    assert _item(text, "个桶，完整").startswith("[通过]")
+
+
+def test_check_parse_errors_elsewhere_do_not_fail_book(tmp_path):
+    cfg, m, end = _rows_cfg(tmp_path, 40)
+    m.parse_errors = {"funding-rate": 1}
+    m._write_health()
+    text, _, _ = run_check(cfg, 60, now_ms=end + 3000)
+    assert _item(text, "盘口").startswith("[通过]")
+    assert "推送解析失败 funding-rate 1 次" in text
+
+
+def test_check_flags_crash_restart(tmp_path, monkeypatch):
+    from flowmon import macos, power
+    cfg, m, end = _rows_cfg(tmp_path, 240)
+    m.started_ms = end - 5 * 60_000  # 5 分钟前被拉起来
+    m._write_health()
+    monkeypatch.setattr(power, "is_macos", lambda: True)
+    monkeypatch.setattr(power, "sleep_assertions", lambda: ["pid 1(caffeinate): PreventUserIdleSystemSleep"])
+    monkeypatch.setattr(power, "power_source", lambda: "AC Power")
+    monkeypatch.setattr(macos, "status", lambda: {"loaded": True, "state": "running", "runs": "4",
+                                                  "last exit code": "1"})
+    (cfg.log_dir).mkdir(parents=True, exist_ok=True)
+    (cfg.log_dir / "launchd.err.log").write_text("Traceback (most recent call last):\nKeyError: 'px'\n")
+    live = Monitor(cfg, instrument())
+    live.lock()  # 监控器正在运行（被 launchd 重新拉起来了）
+    try:
+        text, ok, _ = run_check(cfg, 60, now_ms=end + 3000)
+    finally:
+        live.unlock()
+    assert not ok
+    assert _item(text, "监控器").startswith("[不通过] 监控器在运行") and "在这段时间里重新启动过" in text
+    assert "上次是异常退出" in text
+    assert "KeyError: 'px'" in text
+
+
+def test_check_counts_conn_and_sleep_records(tmp_path):
+    cfg, m, end = _rows_cfg(tmp_path, 40)
+    m._misc(end - 60_000, {"type": "conn", "event": "close", "reason": "stale", "ts": end - 60_000})
+    m._misc(end - 50_000, {"type": "conn", "event": "open", "ts": end - 50_000})
+    m._misc(end - 120_000, {"type": "sleep", "ts": end - 120_000, "from": end - 120_000, "to": end - 90_000,
+                            "secs": 30})
+    m.close()
+    text, _, _ = run_check(cfg, 60, now_ms=end + 3000)
+    assert "连接事件 2，睡眠 1" in text
+    assert _item(text, "阻止睡眠").startswith("[不通过]") and "这段时间睡眠过 1 次" in text
+
+
+def test_bundle_spans_utc_midnight(tmp_path):
+    import zipfile
+
+    from flowmon.selfcheck import write_bundle
+    cfg = make_cfg(tmp_path)
+    d1, d2 = "2026-09-29", "2026-09-30"
+    for d in (d1, d2):
+        (cfg.data_dir / "buckets").mkdir(parents=True, exist_ok=True)
+        (cfg.data_dir / "buckets" / f"{d}.csv").write_text("x\n")
+    (cfg.data_dir / "buckets" / "2026-09-28.csv").write_text("old\n")
+    cfg.log_dir.mkdir(parents=True)
+    (cfg.log_dir / f"flowmon.log.{d1}").write_text("y\n")
+    (cfg.log_dir / "flowmon.log").write_text("z\n")
+    (cfg.log_dir / "launchd.err.log").write_text("")
+    chk = cfg.data_dir / "reports" / "check-x.txt"
+    chk.parent.mkdir(parents=True)
+    chk.write_text("ok")
+    z = write_bundle(cfg, chk, D0 + 30 * 60_000, 60)  # 00:30 UTC，往回 60 分钟跨过零点
+    assert z.parent == tmp_path
+    names = sorted(zipfile.ZipFile(z).namelist())
+    assert names == ["buckets/2026-09-29.csv", "buckets/2026-09-30.csv", "check-x.txt", "logs/flowmon.log",
+                     "logs/flowmon.log.2026-09-29", "logs/launchd.err.log"]

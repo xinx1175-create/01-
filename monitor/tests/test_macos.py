@@ -58,6 +58,8 @@ class FakeLaunchctl:
 
 def test_install_status_restart_uninstall(tmp_path, monkeypatch):
     monkeypatch.setattr(macos.Path, "home", lambda: tmp_path)
+    for k in macos.PROXY_ENV:
+        monkeypatch.delenv(k, raising=False)
     lc = FakeLaunchctl()
     no_wait = lambda s: None  # noqa: E731
     msgs = macos.install(tmp_path / "config.toml", tmp_path / "logs", run=lc, sleep=no_wait)
@@ -66,6 +68,7 @@ def test_install_status_restart_uninstall(tmp_path, monkeypatch):
     assert lc.calls == ["print", "enable", "bootstrap"]
     assert plistlib.loads(p.read_bytes())["ProgramArguments"][5] == str((tmp_path / "config.toml").resolve())
     assert any("自动启动" in m for m in msgs)
+    assert "https_proxy" not in plistlib.loads(p.read_bytes())["EnvironmentVariables"]
 
     st = macos.status(lc)
     assert st == {"loaded": True, "state": "running", "runs": "3", "pid": "4242", "last exit code": "0"}
@@ -172,3 +175,24 @@ def test_power_changes_are_notified(tmp_path, monkeypatch):
 
     asyncio.run(main())
     assert titles == ["改用电池供电", "恢复接电源"]
+
+
+def test_install_carries_shell_proxy(tmp_path, monkeypatch):
+    """终端里设了代理：前台能连上，后台服务也要用同样的代理。"""
+    monkeypatch.setattr(macos.Path, "home", lambda: tmp_path)
+    for k in macos.PROXY_ENV:
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("https_proxy", "http://127.0.0.1:7890")
+    monkeypatch.setenv("ALL_PROXY", "socks5://127.0.0.1:7891")
+    msgs = macos.install(tmp_path / "c.toml", tmp_path / "logs", run=FakeLaunchctl(), sleep=lambda s: None)
+    env = plistlib.loads((tmp_path / "Library" / "LaunchAgents" / "com.flowmon.monitor.plist").read_bytes())[
+        "EnvironmentVariables"]
+    assert env["https_proxy"] == "http://127.0.0.1:7890" and env["ALL_PROXY"] == "socks5://127.0.0.1:7891"
+    assert "http_proxy" not in env and env["LANG"] == "en_US.UTF-8"
+    assert any("代理" in m for m in msgs)
+
+
+def test_socks_proxy_support_installed():
+    """macOS 系统代理是 SOCKS 时，websockets 需要 python-socks 才连得上。"""
+    import importlib
+    importlib.import_module("python_socks.async_.asyncio")

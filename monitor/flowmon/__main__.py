@@ -143,8 +143,13 @@ def cmd_check(a) -> int:
     from .selfcheck import run_check
 
     cfg = config_mod.load(a.config)
-    text, ok = run_check(cfg, a.minutes)
+    now_ms = int(__import__("time").time() * 1000)
+    text, ok, path = run_check(cfg, a.minutes, now_ms)
     print(text)
+    if a.bundle:
+        from .selfcheck import write_bundle
+        z = write_bundle(cfg, path, now_ms, a.minutes)
+        print(f"已打包要发回的文件：{z}")
     return 0 if ok else 1
 
 
@@ -251,6 +256,8 @@ def main(argv=None) -> int:
     r = sub.add_parser("check", help="自检：确认在正常录数据、分数在正常计算，结果同时存到 data/reports/")
     r.add_argument("--config", required=True)
     r.add_argument("--minutes", type=float, default=60, help="检查最近多少分钟，默认 60")
+    r.add_argument("--bundle", action="store_true",
+                   help="把自检结果、这段时间的日志和桶表打成一个压缩包，放在配置文件所在目录")
     r.set_defaults(fn=cmd_check)
 
     r = sub.add_parser("service", help="macOS 后台服务：登录后自动启动、崩溃后自动拉起")

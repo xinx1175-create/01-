@@ -22,6 +22,10 @@ from typing import Callable
 LABEL = "com.flowmon.monitor"
 LAUNCHCTL = "/bin/launchctl"
 STOP_WAIT_S = 40  # 比 ExitTimeOut 多留一点
+# 后台服务不继承终端里的环境变量。安装时终端里设了代理，就把它们写进服务定义，免得前台能连上、后台连不上。
+# 系统设置里的代理（「网络 → 代理」）不用管：程序自己会读到
+PROXY_ENV = ("http_proxy", "https_proxy", "all_proxy", "no_proxy",
+             "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY")
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
@@ -47,7 +51,8 @@ def package_dir() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
-def render_plist(python: str, config: Path, workdir: Path, log_dir: Path) -> bytes:
+def render_plist(python: str, config: Path, workdir: Path, log_dir: Path,
+                 extra_env: dict[str, str] | None = None) -> bytes:
     return plistlib.dumps({
         "Label": LABEL,
         "ProgramArguments": [python, "-m", "flowmon", "run", "--config", str(config), "--no-console-log"],
@@ -61,8 +66,12 @@ def render_plist(python: str, config: Path, workdir: Path, log_dir: Path) -> byt
         # 正常日志写在 logs/flowmon.log（按天切分）；这两个文件只接启动失败、未捕获异常这类输出
         "StandardOutPath": str(log_dir / "launchd.out.log"),
         "StandardErrorPath": str(log_dir / "launchd.err.log"),
-        "EnvironmentVariables": {"PYTHONUNBUFFERED": "1", "LANG": "en_US.UTF-8"},
+        "EnvironmentVariables": {"PYTHONUNBUFFERED": "1", "LANG": "en_US.UTF-8", **(extra_env or {})},
     })
+
+
+def proxy_env() -> dict[str, str]:
+    return {k: os.environ[k] for k in PROXY_ENV if os.environ.get(k)}
 
 
 def venv_python() -> str:
@@ -106,8 +115,11 @@ def install(config: Path, log_dir: Path, run: Runner = _run, sleep=time.sleep) -
         run([LAUNCHCTL, "bootout", target()])
         _wait_unloaded(run, sleep)
         msgs.append("已停掉正在运行的旧服务")
-    p.write_bytes(render_plist(venv_python(), config.resolve(), package_dir(), log_dir.resolve()))
+    env = proxy_env()
+    p.write_bytes(render_plist(venv_python(), config.resolve(), package_dir(), log_dir.resolve(), env))
     msgs.append(f"已写入 {p}")
+    if env:
+        msgs.append(f"终端里设了代理，已一并写进服务：{', '.join(sorted(env))}")
     run([LAUNCHCTL, "enable", target()])
     r = run([LAUNCHCTL, "bootstrap", domain(), str(p)])
     if r.returncode != 0:

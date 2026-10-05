@@ -176,6 +176,8 @@ flowmon run --duration 120
 
 2 分钟后自动停止。如果出现 `连接断开` 反复刷屏、或者 `解析 … 推送失败`，先别往下做，把屏幕输出发给我。
 
+**用了代理软件的话**：监控器会自动使用「系统设置 → 网络 → 详细信息 → 代理」里的系统代理（HTTP 和 SOCKS 都支持）；在终端里用 `export https_proxy=…` 设的代理，第 8 步装服务时会一并写进去。只要这一步能连上，后台服务也能连上。
+
 ## 8. 装成后台服务（开机登录后自动启动、崩溃后自动拉起）
 
 ```bash
@@ -230,27 +232,28 @@ pmset -g assertions | grep caffeinate
 ## 11. 启动一小时后：自检，把结果发回来
 
 ```bash
-flowmon check
+flowmon check --bundle
 ```
 
-会逐项列出「通过 / 不通过」：监控器在运行、最新的桶是不是刚封、最近 60 分钟的桶数和完整率、成交、盘口、持仓量推送频率、分数各项是否在计算、数据延迟、日志里的错误、阻止睡眠、心跳。
+会逐项列出「通过 / 不通过」：监控器在运行（以及有没有崩溃后被重新拉起）、最新的桶是不是刚封、最近 60 分钟的桶数和完整率、成交、盘口、持仓量推送频率、分数是否在计算、数据延迟、日志里的错误、阻止睡眠、心跳。
 「分数」一项会写「预热中 … 最早 某时刻 有效」，这是正常的：首次启动要积累满 24 小时。
 
-把要发回的文件打成一个压缩包放到桌面：
+最后一行是 `已打包要发回的文件：/Users/你的用户名/flowmon/flowmon-check-….zip`。在访达里找到它：
 
 ```bash
-cd ~/flowmon && zip -j ~/Desktop/flowmon-第一小时.zip "$(ls -t data/reports/check-*.txt | head -1)" logs/flowmon.log data/buckets/$(date -u +%F)*.csv && ls -lh ~/Desktop/flowmon-第一小时.zip
+open -R ~/flowmon/flowmon-check-*.zip
 ```
 
-把桌面上的 `flowmon-第一小时.zip` 发给我。里面是：
+把这个 zip 文件发给我。里面是：
 
 | 文件 | 用来确认什么 |
 | --- | --- |
 | `check-….txt` | 自检结论和详细数字（不含心跳地址、通知主题） |
-| `flowmon.log` | 连接、订阅、每个桶一行摘要、警告和错误 |
-| `<今天日期>.csv` | 今天的全部 15 秒桶，含 F、M、A、Z、S 各项：我用它核对分数算得对不对 |
+| `logs/flowmon.log`（跨过 UTC 零点时还有前一天的 `flowmon.log.日期`） | 连接、订阅、每个桶一行摘要、警告和错误 |
+| `buckets/<日期>.csv` | 这一小时涉及的每一天的全部 15 秒桶，含 F、M、A、Z、S 各项：我用它核对分数算得对不对 |
+| `logs/launchd.err.log` | 后台服务启动失败、程序崩溃时的报错（正常是空的） |
 
-配置文件 `config.toml` 不用发（里面有心跳地址和通知主题）。
+配置文件 `config.toml` 不在里面（里面有心跳地址和通知主题），不用发。
 
 ## 12. 看日报
 
@@ -283,7 +286,7 @@ open ~/flowmon/data
 | 要做什么 | 命令 |
 | --- | --- |
 | 看最近的桶 | `flowmon status` |
-| 自检 | `flowmon check` |
+| 自检（加 `--bundle` 顺便打包） | `flowmon check` |
 | 看服务状态 | `flowmon service status` |
 | 停止（下次登录还会自动启动） | `flowmon service stop` |
 | 启动 | `flowmon service start` |
