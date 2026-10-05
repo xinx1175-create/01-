@@ -91,6 +91,21 @@ def test_conditions_flips_and_low_vol(cfg_factory, tmp_path):
     assert out["nt_low_vol"] and out["range_rank"] < 30
 
 
+def test_flip_min_abs_ignores_small_wiggles(cfg_factory):
+    def run(min_abs):
+        cfg = cfg_factory(conditions={"flip_window_minutes": 2, "flip_min_abs": min_abs})
+        cond = Conditions(cfg.conditions, 15, Calendar(None, 15, 30))
+        out = None
+        # 分数在 ±2 之间来回摆，中间有一次真正从 +30 到 −30
+        for i, S in enumerate([2, -2, 2, -2, 30, -30, 2, -2]):
+            row = {"start_ms": T0 + i * W, "complete": True, "high": 100.1, "low": 99.9, "close": 100}
+            out = cond.update(row, True, S)
+        return out["flips"]
+
+    assert run(0) == 7      # 规格原文：每次正负变化都算
+    assert run(15) == 1     # 只看 |S| ≥ 15 的桶
+
+
 # ---------- 信号事件 ----------
 
 def cap(bid=100.0, ask=100.1):
@@ -112,7 +127,8 @@ NOCOND = {"no_trade": False, "no_trade_reason": ""}
 
 
 def test_signal_crossings_and_followup(cfg_factory):
-    cfg = cfg_factory(events={"followup_minutes": 1, "price_horizons_s": [15, 60], "control_per_hour": 0})
+    cfg = cfg_factory(events={"followup_minutes": 1, "price_horizons_s": [15, 60], "control_per_hour": 0},
+                      evaluation={"horizon_s": 60})
     eng = EventEngine(cfg, 0.01)
     eng.on_bucket(row(0), sc(20), NOCOND, cap())
     created, _ = eng.on_bucket(row(1), sc(45), NOCOND, cap())

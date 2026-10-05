@@ -82,6 +82,22 @@ def cmd_report(a) -> int:
     return 0
 
 
+def cmd_evaluate(a) -> int:
+    from .evaluate import evaluate
+    from .replay import days_between
+
+    cfg = config_mod.load(a.config)
+    src = Path(a.src).resolve() if a.src else cfg.data_dir
+    days = days_between(a.frm, a.to or a.frm) if a.frm else None
+    text, verdict = evaluate(cfg, src, days)
+    if a.write:
+        p = src / "reports" / "evaluation.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    print(text)
+    return 0 if verdict else 1
+
+
 def cmd_status(a) -> int:
     from .schema import BUCKET_COLUMNS
     from .storage import load_json, read_csv
@@ -169,6 +185,14 @@ def main(argv=None) -> int:
     r.add_argument("--date", default=None, help="YYYY-MM-DD（UTC），默认昨天")
     r.add_argument("--write", action="store_true", help="同时写到 data/reports/")
     r.set_defaults(fn=cmd_report)
+
+    r = sub.add_parser("evaluate", help="按 §11 判定阶段一是否通过")
+    r.add_argument("--config", required=True)
+    r.add_argument("--from", dest="frm", default=None, help="起始日期，默认全部事件")
+    r.add_argument("--to", default=None)
+    r.add_argument("--src", default=None, help="数据目录，默认配置里的 data_dir")
+    r.add_argument("--write", action="store_true", help="同时写到 data/reports/evaluation.md")
+    r.set_defaults(fn=cmd_evaluate)
 
     r = sub.add_parser("status", help="看最近的桶和事件")
     r.add_argument("--config", required=True)

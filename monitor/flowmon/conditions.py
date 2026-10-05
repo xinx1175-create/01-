@@ -138,7 +138,7 @@ class Conditions:
         fcut = s - self.flip_ms
         while self.signs and self.signs[0][0] <= fcut:
             self.signs.popleft()
-        if score_valid and S:
+        if score_valid and S and abs(S) >= self.cfg.flip_min_abs:
             self.signs.append((s, 1 if S > 0 else -1))
         q = self.signs
         flips = sum(1 for i in range(1, len(q)) if q[i][1] != q[i - 1][1])

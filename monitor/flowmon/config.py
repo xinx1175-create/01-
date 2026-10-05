@@ -85,6 +85,7 @@ class ConditionsCfg:
     low_vol_percentile: float
     flip_window_minutes: float
     flip_count: int
+    flip_min_abs: float
     calendar_file: str
     calendar_before_minutes: float
     calendar_after_minutes: float
@@ -123,6 +124,19 @@ class EventsCfg:
 
 
 @dataclass(frozen=True)
+class EvaluationCfg:
+    horizon_s: int
+    dedupe_minutes: float
+    bootstrap_reps: int
+    bootstrap_seed: str
+    confidence: float
+    weekly_positive_share: float
+    min_signals: int
+    min_weeks: float
+    exclude_no_trade: bool
+
+
+@dataclass(frozen=True)
 class StorageCfg:
     data_dir: str
     log_dir: str
@@ -158,6 +172,7 @@ class Config:
     risk: RiskCfg
     fees: FeesCfg
     events: EventsCfg
+    evaluation: EvaluationCfg
     storage: StorageCfg
     health: HealthCfg
     notify: NotifyCfg
@@ -264,3 +279,8 @@ def _validate(c: Config) -> None:
     need(len(set(c.events.tiers)) == len(c.events.tiers) and all(t > 0 for t in c.events.tiers),
          "events.tiers 必须是不重复的正数")
     need(c.rules.entry_threshold in c.events.tiers, "events.tiers 必须包含进场门槛 rules.entry_threshold")
+    ev = c.evaluation
+    need(ev.horizon_s in c.events.price_horizons_s, "evaluation.horizon_s 必须在 events.price_horizons_s 里")
+    need(0 < ev.confidence < 1, "evaluation.confidence 应在 (0, 1)")
+    need(ev.bootstrap_reps >= 1, "evaluation.bootstrap_reps 至少 1")
+    need(0 < ev.weekly_positive_share <= 1, "evaluation.weekly_positive_share 应在 (0, 1]")

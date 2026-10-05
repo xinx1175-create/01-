@@ -62,6 +62,7 @@ low_vol_lookback_days = 7
 low_vol_percentile = 30
 flip_window_minutes = 30
 flip_count = 3
+flip_min_abs = 0                          # 实现：|S| 低于它的桶不参与翻转计数；0 = 按规格原文，任何正负变化都算
 calendar_file = "calendar.csv"            # 手工维护的经济数据日程，相对本配置文件
 calendar_before_minutes = 15
 calendar_after_minutes = 30
@@ -91,6 +92,17 @@ limit_fill_windows_s = [5, 15]
 market_order_notional_usdt = 600
 control_per_hour = 1                      # 对照组：每小时随机抽 1 个没有信号的时刻
 control_seed = "flowmon-v0.1"             # 实现：抽样种子。同一份数据回放时抽到同一批时刻
+
+[evaluation]                              # §11 阶段一通过标准。看到结果之前定死，事后不改
+horizon_s = 300                           # 唯一判定口径：信号后 5 分钟；必须在 events.price_horizons_s 里
+dedupe_minutes = 5                        # 相邻信号间隔不足 5 分钟，只保留前一条
+bootstrap_reps = 10000                    # 自助抽样次数
+bootstrap_seed = "flowmon-eval-v1"        # 自助抽样种子，固定后同一份数据结果不变
+confidence = 0.95                         # 置信区间
+weekly_positive_share = 0.75              # 至少四分之三的周为正
+min_signals = 300                         # §11 最低数据量：至少 300 次信号
+min_weeks = 2                             # §11 最低数据量：连续至少 2 周
+exclude_no_trade = false                  # 待确认：是否剔除处于 §8 不交易条件的信号
 
 [storage]
 data_dir = "data"                         # 相对本配置文件
