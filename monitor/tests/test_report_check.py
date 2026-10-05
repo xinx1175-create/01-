@@ -73,24 +73,27 @@ def cfg24(tmp_path):
 
 def test_eta_first_start(cfg24):
     rows = _rows([(1, True)])
-    cov, eta = baseline_eta(rows, cfg24)
+    wu = baseline_eta(rows, cfg24)
     n = 24 * H // W
-    assert eta == (n - 1) * W + 4 * W  # 第一个桶算起满 24 小时，再等平滑窗口
-    assert cov == pytest.approx(len(rows) / n)
+    assert wu.eta == (n - 1) * W + 4 * W  # 第一个桶算起满 24 小时，再等平滑窗口
+    assert not wu.ready
+    assert wu.fill == pytest.approx(len(rows) / n) == wu.recent
 
 
 @pytest.mark.parametrize("outage_h", [3, 10, 28])
 def test_eta_after_outage_up_to_28h_is_minutes(cfg24, outage_h):
     rows = _rows([(30, True), (outage_h, False)])
-    _, eta = baseline_eta(rows, cfg24)
+    wu = baseline_eta(rows, cfg24)
     last = rows[-1]["start_ms"]
-    # 基准值马上就够；只等持仓量变化窗口（20 个桶）和平滑窗口（4 个）重新填满
-    assert eta == last + 24 * W
+    # 基准值马上就够；只等持仓量变化窗口（20 个桶）和平滑窗口（4 个）重新填满：重启后 24 个桶，即 6 分钟
+    assert wu.ready and wu.fill == pytest.approx(min(1, (48 - outage_h) / 24))  # 回看 48 小时里停机前的完整桶
+    assert wu.recent == pytest.approx(max(0, 1 - outage_h / 24))
+    assert wu.eta == last + W + 24 * W
 
 
 def test_eta_after_long_outage(cfg24):
     rows = _rows([(30, True), (36, False)])
-    _, eta = baseline_eta(rows, cfg24)
+    eta = baseline_eta(rows, cfg24).eta
     last = rows[-1]["start_ms"]
     # 停机超过 28.8 小时：回看 48 小时里只剩停机前 12 小时的完整桶，不够 19.2 小时（24 × 80%）。
     # 之后每进来一个新桶，就有一个停机前的桶滑出回看范围，要等新数据自己攒够 19.2 小时
@@ -100,7 +103,7 @@ def test_eta_after_long_outage(cfg24):
 def test_eta_strict_lookback(tmp_path):
     cfg = make_cfg(tmp_path, score={"baseline_lookback_hours": 24})
     rows = _rows([(30, True), (10, False)])
-    _, eta = baseline_eta(rows, cfg)
+    eta = baseline_eta(rows, cfg).eta
     # 严格的「过去 24 小时」：停机超过 4.8 小时，要等它滑出 24 小时窗口到只剩 4.8 小时，约 19.2 小时
     assert eta - rows[-1]["start_ms"] == pytest.approx(19.2 * H, abs=6 * W)
 
@@ -145,7 +148,8 @@ def test_check_first_hour(tmp_path):
     assert "[通过] 分数在计算：最近 10 分钟 41 / 41 个完整桶算出了 S" in text
     n = 24 * H // W
     eta = T0 + (n - 1) * W + 4 * W
-    assert f"预热中，假设之后数据都完整，最早 {iso_utc(eta)[:16]}Z 有效" in text
+    assert f"预热中，基准值够了 5%；之后数据都完整的话最早 {iso_utc(eta)[:16]}Z 有效" in text
+    assert "过去 24 小时里完整的桶占 4.9%" in text
     assert "[通过] 数据延迟：中位 40 ms" in text
     assert "[通过] 日志：错误 0 条，警告 1 条" in text
     assert "[通过] 心跳：最近一次报到成功在 25 秒前" in text
@@ -192,12 +196,52 @@ def test_eta_matches_score_engine(cfg24, outage_h):
         rows.append({"start_ms": t, "complete": False, "buy_vol": None, "sell_vol": None, "close": None, "oi": None,
                      "score_valid": False})
         t += W
-    _, eta = baseline_eta(rows, cfg24)
+    eta = baseline_eta(rows, cfg24).eta
     restart = t
     for _ in range(21 * H // W):
         rows.append(full(t, i))
         t, i = t + W, i + 1
     res = score_series(rows, cfg24.score, 15)
     first_valid = next(r["start_ms"] + W for r, x in zip(rows, res) if r["start_ms"] >= restart and x.valid)
-    # 估算是「假设之后数据都完整」时的最早时刻；引擎的第一个有效分数不能早于它，也不该晚太多（差几个桶以内）
-    assert eta <= first_valid <= eta + 4 * W, (iso_utc(eta), iso_utc(first_valid))
+    assert eta == first_valid, (iso_utc(eta), iso_utc(first_valid))
+
+
+@pytest.mark.parametrize("seed", range(150))
+def test_eta_is_exact_on_random_histories(cfg_factory, seed):
+    """随机的历史（零星不完整、成段停机、缺行），之后都完整：估算和分数引擎给出的第一个有效时刻完全一致。"""
+    import random
+
+    from flowmon.score import score_series
+
+    rng = random.Random(seed)
+    base_h = 40 * 15 / 3600  # 40 个桶的基准，回看 1–3 倍
+    cfg = cfg_factory(score={"baseline_hours": base_h, "baseline_lookback_hours": base_h * rng.choice([1, 2, 3])})
+
+    def full(t):
+        return {"start_ms": t, "complete": True, "buy_vol": rng.random() * 5 + 0.1, "sell_vol": rng.random() * 5 + 0.1,
+                "close": 100 + rng.gauss(0, 1), "oi": 1000 + rng.gauss(0, 20), "score_valid": False}
+
+    rows, t = [], 0
+    for _ in range(rng.randint(10, 200)):
+        x = rng.random()
+        if x < 0.04:
+            t += W * rng.randint(1, 3)  # 缺行
+            continue
+        if x < 0.06:  # 一段停机占位
+            for _ in range(rng.randint(5, 60)):
+                rows.append({"start_ms": t, "complete": False, "buy_vol": None, "sell_vol": None, "close": None,
+                             "oi": None, "score_valid": False})
+                t += W
+            continue
+        r = full(t)
+        r["complete"] = rng.random() > 0.05
+        rows.append(r)
+        t += W
+    if not rows:
+        return
+    eta = baseline_eta(rows, cfg).eta
+    last = rows[-1]["start_ms"]
+    future = [full(last + k * W) for k in range(1, 400)]
+    res = score_series(rows + future, cfg.score, 15)
+    got = next((r["start_ms"] + W for r, x in zip(rows + future, res) if r["start_ms"] > last and x.valid), None)
+    assert eta == got

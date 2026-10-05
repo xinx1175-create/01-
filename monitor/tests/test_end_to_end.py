@@ -80,3 +80,58 @@ def test_live_restart_replay_consistency(tmp_path):
     assert cmp["buckets_common"] == len(rows)
     assert cmp["score_mismatch"] == 0, cmp
     assert cmp["events_only_live"] == [], cmp
+
+
+def test_replay_from_second_day_matches_live(tmp_path):
+    """从中间某天开始回放：先用之前存下的实时桶预热分数，和实时逐桶对得上。
+
+    行情从 UTC 零点前 16 分钟开始（加速 60 倍），第一天里停推 8 分钟，让第二天开头的基准值要回看到第一天。
+    """
+    import time as _time
+    from datetime import datetime, timedelta, timezone
+
+    now = datetime.fromtimestamp(_time.time() + 600, tz=timezone.utc)
+    midnight = datetime(now.year, now.month, now.day, tzinfo=timezone.utc) + timedelta(days=1)
+    start = int((midnight - timedelta(minutes=16)).timestamp() * 1000)  # 模拟时间要走在真实时间前面
+
+    async def main():
+        rest = serve_rest("127.0.0.1", 0)
+        stop, ready = asyncio.Event(), asyncio.Event()
+        fake = FakeOkx(speed=SPEED, seed=21, start_ms=start, faults=[(240, "silence")])
+        srv = asyncio.create_task(fake.serve("127.0.0.1", 0, stop, ready))
+        await ready.wait()
+        cfg = make_cfg(
+            tmp_path,
+            exchange={"ws_public_url": f"ws://127.0.0.1:{fake.port}/ws/v5/public",
+                      "rest_base_url": f"http://127.0.0.1:{rest.server_address[1]}"},
+            score={"baseline_hours": 0.1, "baseline_lookback_hours": 0.3},  # 24 个桶，回看 72 个桶
+            events={"followup_minutes": 5, "price_horizons_s": [15, 60, 300]},
+            notify={"on_start": False},
+        )
+        m = Monitor(cfg, load_instrument(cfg))
+        m.restore()
+        await m.run(duration_s=30)
+        stop.set()
+        await srv
+        rest.shutdown()
+        return cfg
+
+    cfg = asyncio.run(main())
+    data = cfg.data_dir
+    days = days_of(data)
+    assert len(days) == 2, days
+    day2 = days[1]
+
+    out = tmp_path / "replay"
+    stats = Replayer(cfg, data, out).run(day2, day2)
+    assert stats["warmup"] > 0
+    cmp = compare(cfg, data, out, [day2])
+    assert cmp["buckets_common"] == cmp["buckets_live"] > 0
+    assert cmp["score_mismatch"] == 0, cmp
+
+    # 不预热就对不上：确认这个测试确实测到了预热
+    cold = tmp_path / "replay_cold"
+    r = Replayer(cfg, data, cold)
+    r.warm_up = lambda *a: 0
+    r.run(day2, day2)
+    assert compare(cfg, data, cold, [day2])["score_mismatch"] > 0

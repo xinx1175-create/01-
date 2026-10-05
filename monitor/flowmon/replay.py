@@ -8,7 +8,9 @@
 - 近处挂单只能用存下的前 N 档算，范围铺不满时偏小（near_truncated=1）。
 - 数据延迟只用逐笔成交算（实时还包含盘口推送）。
 - 完整性沿用实时记录：实时判为不完整的时段，回放也判为不完整；实时重启时补写的停机占位桶（downtime），
-  回放也生成同样的占位桶；连占位桶都没有的时段（例如回放范围外）直接跳过。
+  回放也生成同样的占位桶；连占位桶都没有的时段直接跳过。
+- 回放开始前，先把回放范围之前存下的实时桶喂给分数和不交易条件（和实时重启时 restore() 一样），
+  所以从中间某天开始回放也能和实时对上。桶宽改了时这些桶用不上，回放从零开始预热。
 - 实时里封桶后才到的成交（late_trades）回放时会算进它本该在的桶。
 """
 from __future__ import annotations
@@ -70,6 +72,24 @@ class Replayer:
         self.ct = contract_size(meta["instrument"])
         self.w = cfg.bucket.width_s * 1000
 
+    def warm_up(self, score: ScoreEngine, cond: Conditions, day_from: str) -> int:
+        """回放范围之前最近 restore_days 天的实时桶喂给分数和不交易条件，返回用了多少个桶。"""
+        cfg = self.cfg
+        bdir = self.src / "buckets"
+        days = sorted({p.name[:10] for p in bdir.glob("*.csv") if p.name[:10] < day_from})
+        days = days[-cfg.storage.restore_days:]
+        rows = sorted(read_csv(day_files(bdir, days, ".csv"), dict(bucket_columns(cfg))),
+                      key=lambda r: r["start_ms"])
+        n, last = 0, None
+        for r in rows:
+            if r["width_s"] != cfg.bucket.width_s or (last is not None and r["start_ms"] <= last):
+                continue
+            sc = score.update(r)
+            cond.update(r, sc.valid, sc.S)
+            last = r["start_ms"]
+            n += 1
+        return n
+
     def run(self, day_from: str, day_to: str) -> dict:
         cfg, w = self.cfg, self.w
         days = days_between(day_from, day_to)
@@ -96,7 +116,8 @@ class Replayer:
         ev_cols = [n for n, _ in event_columns(cfg)]
         w_b = DailyCsv(self.out / "buckets", [n for n, _ in bucket_columns(cfg)])
         w_e = DailyCsv(self.out / "events", ev_cols)
-        stats = {"buckets": 0, "skipped": 0, "events": 0, "trades": 0}
+        stats = {"buckets": 0, "skipped": 0, "events": 0, "trades": 0,
+                 "warmup": self.warm_up(score, cond, day_from)}
         prev_close = None
         li = 0
 

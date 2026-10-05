@@ -65,44 +65,69 @@ def monitor_running(cfg: Config) -> bool:
         return False
 
 
-def baseline_eta(rows: list[dict], cfg: Config) -> tuple[float, int | None]:
-    """返回 (最后一个桶时，基准用的完整桶够了几成, 假设之后数据都完整时分数最早有效的时刻)。
+@dataclass
+class Warmup:
+    fill: float          # 基准值用的完整桶（回看范围内最近 n 个）够了几成
+    recent: float        # 过去 baseline_hours 里完整的桶占几成
+    ready: bool          # 最后一个桶时基准值是否已经有效
+    eta: int | None      # 假设之后的桶都完整，分数最早在哪个时刻有效（那个桶的结束时间）
 
-    规则同 score.ScoreEngine.baseline_ready：从第一个桶算起已经记录满 baseline_hours，且回看
-    baseline_lookback_hours 内的完整桶至少有 baseline_hours 的 baseline_min_coverage。
-    之后持仓量变化窗口和平滑窗口还要填满，所以再加这两段。rows 要按时间排好、覆盖回看范围。
+
+def baseline_eta(rows: list[dict], cfg: Config) -> Warmup:
+    """按分数引擎（score.ScoreEngine）的规则往后推演，估算分数什么时候有效。rows 要按时间排好、覆盖回看范围。
+
+    R 有效要：基准值有效（从第一个桶算起记录满 baseline_hours，且回看 baseline_lookback_hours 内的完整桶
+    至少有 n × baseline_min_coverage 个）；本桶、成交方向窗口里的桶、价格窗口起点、持仓量变化窗口起点都完整。
+    S 有效要平滑窗口里的 R 都有效。缺的行按不完整算；最后一个桶之后假设都完整。
     """
     sc = cfg.score
     w = cfg.bucket.width_s * 1000
     n = max(1, round(sc.baseline_hours * 3600 / cfg.bucket.width_s))
     look = max(n, round(sc.baseline_lookback_hours * 3600 / cfg.bucket.width_s))
     if not rows:
-        return 0.0, None
+        return Warmup(0.0, 0.0, False, None)
     first = rows[0]["start_ms"]
     last = rows[-1]["start_ms"]
-    done = sorted(r["start_ms"] for r in rows if r["complete"])
+    complete = {r["start_ms"]: bool(r["complete"]) for r in rows}
+    done = sorted(t for t, ok in complete.items() if ok)
+
+    def ok(t: int) -> bool:
+        return t > last or complete.get(t, False)
 
     def count(t: int) -> int:
-        # 回看范围 (t − look·w, t] 里的完整桶：已有的 + 假设 last 之后的桶都完整；最多用 n 个
+        # 回看范围 (t − look·w, t] 里的完整桶：已有的 + 假设 last 之后的都完整；最多用 n 个
         lo = t - look * w
         have = bisect.bisect_right(done, t) - bisect.bisect_right(done, lo)
-        future = max(0, (t - max(last, lo)) // w)
-        return min(n, have + future)
+        return min(n, have + max(0, (t - max(last, lo)) // w))
 
     def ready(t: int) -> bool:
         return t - (n - 1) * w >= first and count(t) >= sc.baseline_min_coverage * n
 
-    cov_now = count(last) / n
-    if ready(last):
-        # 基准已经够了，分数还没有效的话是在等持仓量变化窗口和平滑窗口重新填满（重启后的头几分钟），按上限估
-        return cov_now, last + (sc.oi_window_buckets + sc.smooth_buckets) * w
+    def doi_ok(t: int) -> bool:
+        # 这个桶能算出持仓量变化：本桶和持仓量变化窗口起点都完整
+        return ok(t) and ok(t - sc.oi_window_buckets * w)
+
+    def r_valid(t: int) -> bool:
+        need = [t - k * w for k in range(sc.flow_window_buckets + 1)] + [t - sc.oi_window_buckets * w]
+        if not (all(ok(x) for x in need) and ready(t)):
+            return False
+        # Z 的标准差至少要两个持仓量变化值（回看范围内）
+        k = 0
+        x = t
+        while x > t - look * w and k < 2:
+            k += doi_ok(x)
+            x -= w
+        return k >= 2
+
+    recent = (bisect.bisect_right(done, last) - bisect.bisect_right(done, last - n * w)) / n
+    out = Warmup(count(last) / n, recent, ready(last), None)
     t = last
-    for _ in range(look + n + 2):
+    for _ in range(look + n + sc.oi_window_buckets + sc.smooth_buckets + 2):
         t += w
-        if ready(t):
-            # 平滑窗口里的 R 都要在基准有效之后；桶结束时才算出分数
-            return cov_now, t + sc.smooth_buckets * w
-    return cov_now, None
+        if all(r_valid(t - k * w) for k in range(sc.smooth_buckets)):
+            out.eta = t + w
+            break
+    return out
 
 
 def _log_lines(cfg: Config, since_ms: int, now_ms: int) -> list[str]:
@@ -217,13 +242,16 @@ def run_check(cfg: Config, minutes: float = 60, now_ms: int | None = None) -> tu
     tail = [r for r in comp if r["start_ms"] >= last["start_ms"] - 10 * 60_000]
     s_tail = sum(1 for r in tail if r["S"] is not None)
     valid = sum(1 for r in win if r["score_valid"])
-    cov, eta = baseline_eta(rows, cfg)
+    wu = baseline_eta(rows, cfg)
+    eta_txt = f"{iso_utc(wu.eta)[:16]}Z" if wu.eta is not None else "?"
     if last["score_valid"]:
         valid_txt = f"分数有效 {valid} 个桶"
-    elif eta is not None:
-        valid_txt = f"有效分数 {valid} 个（预热中，假设之后数据都完整，最早 {iso_utc(eta)[:16]}Z 有效）"
+    elif wu.ready:
+        valid_txt = (f"有效分数 {valid} 个（基准值已就绪，在等成交、持仓量变化和平滑窗口重新填满；"
+                     f"之后数据都完整的话 {eta_txt} 有效）")
     else:
-        valid_txt = f"有效分数 {valid} 个"
+        valid_txt = (f"有效分数 {valid} 个（预热中，基准值够了 {wu.fill:.0%}；"
+                     f"之后数据都完整的话最早 {eta_txt} 有效）")
     seen = "，".join(f"{k} {v}" for k, v in has.items())
     if run_min < 10:
         items.append(Item("等待", f"分数：刚启动 {run_min:.0f} 分钟，S 要 7 分钟左右才开始有数（各项已算出：{seen}）"))
@@ -236,8 +264,10 @@ def run_check(cfg: Config, minutes: float = 60, now_ms: int | None = None) -> tu
         detail.append(f"S 范围 {min(s_vals):.1f} ~ {max(s_vals):.1f}，|S| 中位 {statistics.median(abs(x) for x in s_vals):.1f}")
     notes = Counter(x for r in win for x in (r["score_note"] or "").split("|") if x)
     detail.append("分数无效原因：" + ("，".join(f"{k} {v}" for k, v in notes.most_common()) or "无"))
-    detail.append(f"基准值：最后一个桶时，过去 {cfg.score.baseline_hours:g} 小时完整桶占 {cov:.1%}"
-                  f"（要 ≥ {cfg.score.baseline_min_coverage:.0%}，并且历史铺满 {cfg.score.baseline_hours:g} 小时）")
+    sc = cfg.score
+    detail.append(f"基准值：回看 {sc.baseline_lookback_hours:g} 小时内的完整桶够 {sc.baseline_hours:g} 小时的 "
+                  f"{wu.fill:.1%}（要 ≥ {sc.baseline_min_coverage:.0%}，且从第一个桶算起记录满 "
+                  f"{sc.baseline_hours:g} 小时）；过去 {sc.baseline_hours:g} 小时里完整的桶占 {wu.recent:.1%}")
 
     # ---------- 6. 延迟 ----------
     lats = sorted(r["latency_ms"] for r in win if r["latency_ms"] is not None)
