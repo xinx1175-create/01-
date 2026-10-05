@@ -9,7 +9,7 @@
 | --- | --- |
 | 源代码 | `flowmon/`，按 数据接入 / 数据桶 / 分数 / 不交易条件 / 事件 / 存储 分模块 |
 | 配置文件样例 | `config.example.toml`，对应 §13，代码里没有任何默认值 |
-| 单元测试 | `tests/`，47 个单元测试 + 1 个端到端测试，全部通过 |
+| 单元测试 | `tests/`，58 个单元测试 + 1 个端到端测试，全部通过 |
 | 阶段一判定工具 | `python -m flowmon evaluate`，按已定口径判定 §11 阶段一是否通过，见「阶段一判定」 |
 | 说明文件 | 本文件 |
 | 至少 1 小时的实际运行记录 | 不单独做：直接部署到服务器开始正式记录，启动后第一个小时的日志和数据就是这份记录，步骤见「部署到服务器」。开发环境连不上 OKX，部署前用本地假交易所跑过 39.6 小时模拟时长的连续运行，见 [docs/sim-run.md](docs/sim-run.md) |
@@ -97,6 +97,9 @@ python -m flowmon run --config config.toml --duration 3600  # 跑 1 小时自动
    sudo -u flowmon cp /opt/flowmon/src/monitor/config.example.toml /opt/flowmon/config.toml
    sudo -u flowmon cp /opt/flowmon/src/monitor/calendar.example.csv /opt/flowmon/calendar.csv
    ```
+   下面的命令都在 `/opt/flowmon/src/monitor` 目录下、以 flowmon 用户执行，例如
+   `cd /opt/flowmon/src/monitor && sudo -u flowmon /opt/flowmon/venv/bin/python -m flowmon status --config /opt/flowmon/config.toml`；
+   用 root 试跑会让数据目录归 root 所有，之后 systemd 以 flowmon 身份启动时写不进去。
    配置里的相对路径（`data`、`logs`、`calendar.csv`）都相对配置文件所在目录，也就是落在 `/opt/flowmon/` 下。改好 `[notify]`，用 `notify` 命令试发一条。
 5. **试跑 2 分钟**：`python -m flowmon run --config /opt/flowmon/config.toml --duration 120`，然后 `status` 看到 `完整=1` 的桶、日志里没有「解析 … 推送失败」，再继续。
 6. **常驻**：把 `deploy/flowmon.service` 里的路径对上（`WorkingDirectory=/opt/flowmon/src/monitor`），放到 `/etc/systemd/system/`，
@@ -105,7 +108,7 @@ python -m flowmon run --config config.toml --duration 3600  # 跑 1 小时自动
    顺便对照下面「与 OKX 官方文档的核对」里标「待确认」的几项：日志里没有解析错误，说明字段名对得上；
    `grep -c '"type":"oi"' data/raw/misc/<当天>.jsonl` 每小时约 1200 条，说明持仓量确实约 3 秒推一次。
 8. **24 小时后**：`score_valid` 开始为 1，信号事件开始写入；之后每天收到日报推送。
-9. **2 周以上、筛选去重后满 300 条信号**：`python -m flowmon evaluate --config /opt/flowmon/config.toml --write`。
+9. **预热后满 2 周有效数据、筛选去重后满 300 条信号**：`python -m flowmon evaluate --config /opt/flowmon/config.toml --write`。
 
 ## 查看数据
 
@@ -208,7 +211,7 @@ python -m flowmon evaluate --config config.toml --write     # 结果写到 data/
 - 「整段数据」从第一个有效分数开始，到最后一个桶结束；头 24 小时预热期不可能有信号，不算在内。没有信号的段不算「为正」。
 - 对照组每小时 4 条：一小时等分 4 段，每段随机抽一个时刻，方向随机，种子固定（`events.control_seed`）。自助抽样的种子也固定（`evaluation.bootstrap_seed`），同一份数据结果不变。
 - 5 分钟是唯一的判定口径。15 秒、1、2、15、30 分钟的结果照常列在报告里，不参与判定。
-- 数据量按筛选、去重之后的条数算：覆盖满 2 周、且满 300 条，两个都满足才给结论；不够就继续跑，报告照出，结论写「不做判定」。
+- 数据量：筛选、去重之后满 300 条，且从第一个有效分数起实际有完整数据的时长满 14 天（停机、断线等不完整的时段不计），两个都满足才给结论；不够就继续跑，报告照出，结论写「不做判定」。时长向下取两位小数显示，不会出现显示 14.00 天却判为不够的情况。
 
 ## 回放工具
 
@@ -262,7 +265,8 @@ python -m pytest -q tests
   翻转规则（你给的两个例子原样核对、恰好 ±20、上一次超出已滑出窗口、四个门槛各一份）；
   信号穿越（多档、空头、上一个桶无效）、之后各时点价格和 MFE/MAE、限价单成交判定、对照组每 15 分钟一条且可复现、停机断档。
 - `test_evaluate.py`：§11 判定的收益口径（起算价用预计成交价）、5 分钟去重、自助区间可复现；通过、手续费不够、空头为负、4 段里 1 段为负（通过）和 2 段为负（不通过）、
-  不交易条件下的信号被剔除但出现在参考行、筛选后不足 300 条、数据不够。
+  不交易条件下的信号被剔除但出现在参考行、筛选后不足 300 条；预热期和中间停机不计入 2 周、正好 14 天算够、数据不够。
+- `test_cli.py`：同一天表头变化另起 `D.1.csv` 后，`status` 仍显示真正最新的桶。
 - `test_end_to_end.py`：起一个加速 60 倍的假交易所，实时监控器中途重启一次，注入 seqId 断档、断线、停推，然后回放并逐桶比对，要求分数零差异。
 
 ## 与 OKX 官方文档的核对（§4、§14）

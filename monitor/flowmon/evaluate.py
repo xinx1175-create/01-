@@ -14,6 +14,7 @@
 """
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,6 +77,14 @@ class Check:
     ok: bool | None  # None = 算不出来
 
 
+DAY_MS = 86_400_000
+
+
+def _days(x: float) -> str:
+    """向下取两位小数，免得 13.999 天显示成「14.00」却判为不够。"""
+    return f"{math.floor(x * 100 + 1e-9) / 100:.2f}"
+
+
 def _pct(x: float | None, nd: int = 4) -> str:
     return "-" if x is None else f"{x:.{nd}f}%"
 
@@ -106,16 +115,18 @@ def evaluate(cfg: Config, data: Path, days: list[str] | None = None) -> tuple[st
     rs = [same_dir_return(e, h) for e in sig]
     rc = [same_dir_return(e, h) for e in ctrl]
 
+    # 「整段数据」从第一个有效分数开始，到最后一个桶结束：预热期不可能有信号，不算在内。
+    # 2 周的门槛和 4 段的切分用同一个起点；门槛按其中实际有完整数据的时长算，停机、断线的时段不计
+    w_ms = cfg.bucket.width_s * 1000
     t0 = t1 = None
-    span_days = 0.0
-    if buckets:
-        starts = [b["start_ms"] for b in buckets]
-        span_days = (max(starts) - min(starts)) / 86_400_000
-        # 分段用的「整段数据」从第一个有效分数开始：预热期不可能有信号，算进去会让第一段系统性偏少
-        valid = [b["start_ms"] for b in buckets if b["score_valid"]]
-        if valid:
-            t0, t1 = min(valid), max(starts) + cfg.bucket.width_s * 1000
-    enough = len(rs) >= ev_cfg.min_signals and span_days >= ev_cfg.min_weeks * 7 and len(rc) >= 2
+    span_days = covered_days = 0.0
+    valid = [b["start_ms"] for b in buckets if b["score_valid"]]
+    if valid:
+        t0 = min(valid)
+        t1 = max(b["start_ms"] for b in buckets) + w_ms
+        span_days = (t1 - t0) / DAY_MS
+        covered_days = len({b["start_ms"] for b in buckets if b["start_ms"] >= t0 and b["complete"]}) * w_ms / DAY_MS
+    enough = len(rs) >= ev_cfg.min_signals and covered_days >= ev_cfg.min_weeks * 7 and len(rc) >= 2
 
     fee_rt = 2 * fees.taker_rate * 100
     fee_ref = (fees.taker_rate + fees.maker_rate) * 100
@@ -172,7 +183,8 @@ def evaluate(cfg: Config, data: Path, days: list[str] | None = None) -> tuple[st
         "",
         "| 数据 | 数量 |",
         "| --- | --- |",
-        f"| 覆盖天数 | {span_days:.1f} 天（要求 ≥ {ev_cfg.min_weeks * 7:g} 天） |",
+        f"| 有效数据时长 | {_days(covered_days)} 天（要求 ≥ {ev_cfg.min_weeks * 7:g} 天）："
+        f"从第一个有效分数起共 {_days(span_days)} 天，其中停机或数据不完整 {_days(span_days - covered_days)} 天不计 |",
         f"| {tier:g} 档信号 | {len(sig_tier)} 条，其中处于不交易条件 {len(nt_sig)} 条"
         + ("（不进判定）" if ev_cfg.exclude_no_trade else "（照常计入）") + " |",
         f"| 筛选、去重后 | {len(sig_d)} 条，缺 {h} 秒价格或预计成交价的 {len(sig_d) - len(sig)} 条不计 |",

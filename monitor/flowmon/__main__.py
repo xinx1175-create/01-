@@ -100,14 +100,17 @@ def cmd_evaluate(a) -> int:
 
 def cmd_status(a) -> int:
     from .schema import bucket_columns
-    from .storage import load_json, read_csv
+    from .storage import day_files, load_json, read_csv
 
     cfg = config_mod.load(a.config)
-    files = sorted((cfg.data_dir / "buckets").glob("*.csv"))
-    if not files:
+    # 同一天可能有多个文件（表头变了会另起 D.1.csv），按日期取最后一天，再读这一天的全部文件
+    bdir, edir = cfg.data_dir / "buckets", cfg.data_dir / "events"
+    days = sorted({p.name[:10] for p in bdir.glob("*.csv")})
+    if not days:
         print("还没有任何桶数据")
         return 1
-    rows = list(read_csv([files[-1]], dict(bucket_columns(cfg))))
+    rows = sorted(read_csv(day_files(bdir, days[-1:], ".csv"), dict(bucket_columns(cfg))),
+                  key=lambda r: r["start_ms"])
     last = rows[-a.n:]
     print(f"{'时间(UTC)':24} {'完整':4} {'收盘':>10} {'买量':>8} {'卖量':>8} {'F':>6} {'M':>5} {'Z':>6} {'S':>7} 有效 不交易")
     for r in last:
@@ -117,11 +120,11 @@ def cmd_status(a) -> int:
               f"{f(r['sell_vol'], 3):>8} {f(r['F']):>6} {f(r['M']):>5} {f(r['Z']):>6} {f(r['S'], 1):>7} "
               f"{int(r['score_valid']):4} {r['no_trade_reason'] or '-'}")
     n_inc = sum(1 for r in rows if not r["complete"])
-    print(f"\n{files[-1].name}：{len(rows)} 个桶，不完整 {n_inc} 个")
-    ev = sorted((cfg.data_dir / "events").glob("*.csv"))
-    if ev:
-        n = sum(1 for _ in read_csv([ev[-1]]))
-        print(f"{ev[-1].name}：{n} 条已完成的事件")
+    print(f"\n{days[-1]}：{len(rows)} 个桶，不完整 {n_inc} 个")
+    edays = sorted({p.name[:10] for p in edir.glob("*.csv")})
+    if edays:
+        n = sum(1 for _ in read_csv(day_files(edir, edays[-1:], ".csv")))
+        print(f"{edays[-1]}：{n} 条已完成的事件")
     st = load_json(cfg.data_dir / "state" / "events.json")
     if st:
         print(f"正在跟踪的事件：{len(st.get('pending', []))} 条")

@@ -5,10 +5,11 @@ import pytest
 
 from flowmon.bucket import day_of, iso_utc
 from flowmon.evaluate import bootstrap_diff_ci, dedupe, evaluate, same_dir_return
-from flowmon.schema import bucket_columns, event_columns
+from flowmon.schema import event_columns
 from flowmon.storage import DailyCsv
 
 DAY = 86_400_000
+W = 15_000
 T0 = 1_790_640_000_000  # 2026-09-29T00:00:00Z
 
 
@@ -20,19 +21,31 @@ def ev(cols, ts, kind, d, r_pct, tier=40.0, entry=100.0, no_trade=False):
     return e
 
 
+def write_buckets(cfg, start, end, valid_from=None, gaps=()):
+    """逐个 15 秒桶写桶表（只写判定用到的几列）。valid_from 之前分数无效（预热）；gaps 里的时段没有记录。"""
+    d = cfg.data_dir / "buckets"
+    d.mkdir(parents=True, exist_ok=True)
+    files = {}
+    for t in range(start, end, W):
+        if any(a <= t < b for a, b in gaps):
+            continue
+        day = day_of(t)
+        if day not in files:
+            files[day] = (d / f"{day}.csv").open("w", newline="")
+            files[day].write("start_ms,width_s,complete,score_valid\n")
+        files[day].write(f"{t},15,1,{0 if valid_from is not None and t < valid_from else 1}\n")
+    for f in files.values():
+        f.close()
+
+
 def write(cfg, events, days, warmup_days=0):
     cols = [c for c, _ in event_columns(cfg)]
     w = DailyCsv(cfg.data_dir / "events", cols)
     for e in sorted(events, key=lambda x: x["ts_ms"]):
         w.write(day_of(e["ts_ms"]), e)
     w.close()
-    b = DailyCsv(cfg.data_dir / "buckets", [c for c, _ in bucket_columns(cfg)])
-    rows = [(T0, True), (T0 + days * DAY, True)]
-    if warmup_days:  # 预热期：比 T0 早，分数无效
-        rows.insert(0, (T0 - warmup_days * DAY, False))
-    for t, valid in rows:
-        b.write(day_of(t), {"start_ms": t, "width_s": 15, "complete": True, "score_valid": valid})
-    b.close()
+    # 从 T0 起 days 天全部有效；warmup_days 是 T0 之前分数无效的预热期
+    write_buckets(cfg, T0 - warmup_days * DAY, T0 + days * DAY, valid_from=T0)
 
 
 def build(cfg, n_sig, sig_mean, ctrl_mean=0.0, days=15, seed=1, bad_week=False, shorts_bad=False,
@@ -123,7 +136,32 @@ def test_segments_start_at_first_valid_score(cfg):
     text, verdict = evaluate(cfg, cfg.data_dir)
     assert "4 / 4 段为正" in text and verdict is True, text
     assert "无信号" not in text
-    assert "| 覆盖天数 | 18.0 天" in text  # 覆盖天数仍从开始记录算
+    assert "| 有效数据时长 | 15.00 天" in text  # 预热的 3 天不算
+
+
+def test_warmup_not_counted_toward_two_weeks(cfg):
+    # 1 天预热 + 13 天有效：合起来 14 天，但有效数据只有 13 天，不给结论
+    build(cfg, 320, 0.3, days=13, warmup_days=1)
+    text, verdict = evaluate(cfg, cfg.data_dir)
+    assert verdict is None and "| 有效数据时长 | 13.00 天" in text, text
+
+
+def test_outage_not_counted_toward_two_weeks(cfg):
+    # 首尾跨 15 天，但中间停机 6 天：有效数据只有 9 天，不给结论
+    build(cfg, 320, 0.3)
+    for p in (cfg.data_dir / "buckets").glob("*.csv"):
+        p.unlink()
+    write_buckets(cfg, T0, T0 + 15 * DAY, valid_from=T0, gaps=[(T0 + 4 * DAY, T0 + 10 * DAY)])
+    text, verdict = evaluate(cfg, cfg.data_dir)
+    assert verdict is None
+    assert "| 有效数据时长 | 9.00 天" in text and "停机或数据不完整 6.00 天不计" in text, text
+
+
+def test_exactly_two_weeks_is_enough(cfg):
+    # 正好 14 天的桶（14 × 5760 个）：够 2 周，给结论；显示不四舍五入
+    build(cfg, 320, 0.3, days=14)
+    text, verdict = evaluate(cfg, cfg.data_dir)
+    assert verdict is True and "| 有效数据时长 | 14.00 天" in text, text
 
 
 def test_time_segments_two_negative_fails(cfg):
