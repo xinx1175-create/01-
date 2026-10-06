@@ -1,0 +1,93 @@
+# 爆仓数据和防双杀规则（BTC、ETH、SOL 永续，只记录，不下单）。
+#
+# 复制成 liq.toml，和 config.toml 放在同一个目录，监控器启动时会自动读它；没有这个文件就不采集爆仓数据。
+#   cp liq.example.toml liq.toml
+# 规则和 config.toml 一样：每一项都必须写，少写、多写都会报错。
+# 改完要重启监控器（python -m flowmon service restart --config config.toml）才生效；
+# 报告（python -m flowmon liq-report）每次运行都重新读这个文件。
+
+[collect]
+insts = ["BTC-USDT-SWAP", "ETH-USDT-SWAP", "SOL-USDT-SWAP"]
+backfill_days = 30                 # 启动时回补多少天：K 线、持仓量、多空人数比、爆仓单都尽量补，交易所给不了就补到给的为止
+rest_poll_s = 60                   # 每分钟调一次 REST 补全爆仓单（实时推送每个合约每秒最多推一笔，不是全部）
+rest_overlap_s = 120               # 每次多往回翻 2 分钟，接住晚到的记录（按时间戳等字段去重）
+candle_poll_s = 60                 # 1 分钟 K 线每分钟更新一次
+rubik_poll_s = 60                  # 整点后每分钟查一次持仓量、多空人数比的小时数据，直到拿到新的一点
+rubik_wait_max_s = 1200            # 整点后最多查 20 分钟
+second_bars = true                 # 用三个币的逐笔成交合成 1 秒 K 线（算止损滑点用，每天约 15 MB）
+oi_snapshot_s = 10                 # 实时持仓量最多 10 秒记一条
+
+[rest]
+# 限频：以 OKX 官方文档为准。这里是偏保守的间隔（待核对），被限频时会自动等一会儿再试。
+timeout_s = 10
+retries = 3
+retry_wait_s = 2
+rate_limit_wait_s = 5
+max_pages = 2000                   # 一次往回翻页的上限
+interval_liq_s = 0.1               # /api/v5/public/liquidation-orders
+interval_candles_s = 0.1           # /api/v5/market/candles
+interval_history_candles_s = 0.15  # /api/v5/market/history-candles
+interval_rubik_s = 0.5             # /api/v5/rubik/stat/...（持仓量、多空人数比）
+interval_instruments_s = 0.15      # /api/v5/public/instruments
+
+[alerts]
+enabled = true
+single_usd = [1000000, 500000, 200000]    # 单笔爆仓 ≥ 这个金额（美元）就推送，顺序同 insts
+window_minutes = 5
+window_usd = [5000000, 2000000, 1000000]  # 5 分钟内同一方向累计 ≥ 这个金额就推送
+hour_mult = 3.0                           # 某小时多头或空头爆仓量 ≥ 过去 7 天小时均值的 3 倍就推送
+signal = true                             # 出信号时推送（只记录，不下单）
+
+[baseline]
+days = 7                           # 「过去 7 天」：爆仓倍数、多空人数比分位、平均小时波动都按这个窗口
+min_coverage = 0.8                 # 窗口里至少 80% 的小时有数据才算，不够就记为「数据不够」
+rubik_avail_s = 240                # 回补来的持仓量、多空人数比按「整点后 4 分钟才拿得到」处理（实时采集的按实际拿到的时间）
+ratio_max_age_s = 7200             # 多空人数比最多用 2 小时前的
+oi_live_tol_s = 120                # 自己录的持仓量离整点 2 分钟以内才用，否则用交易所的小时统计
+
+[heatmap]
+lookback_hours = 72                # 过去 72 小时每小时新增的持仓量
+leverages = [25, 50, 100]
+leverage_weights = [1, 1, 1]       # 新增持仓平均分到三种杠杆
+mmr = 0.004                        # 维持保证金率 0.4%：多头强平价 = 均价 ×(1 − 1/杠杆 + 0.004)，空头 = 均价 ×(1 + 1/杠杆 − 0.004)
+bin_pct = 0.1                      # 按 0.1% 的价格间隔累计
+zone_frac = 0.5                    # 一侧（现价上方或下方）最大格子的一半以上算密集
+zone_merge_bins = 2                # 密集格子之间隔着不超过 2 格就并成一个密集区
+top_n = 2                          # 上方、下方各输出最密集的 2 个
+
+[signal]
+ratio_pct = 10                     # 多空人数比在过去 7 天最高的 10% 且收盘跌破上一小时最低 → 做空；最低的 10% 且收盘突破上一小时最高 → 做多
+liq_mult = 2.0                     # 加强版另外要求：信号小时内被挤一方的爆仓量 > 过去 7 天小时均值的 2 倍
+decision_delay_s = 300             # 整点收盘后 5 分钟做决定、进场（等小时数据出来、等 REST 补全爆仓单）
+entry_max_wait_s = 600             # 决策后 10 分钟内没有价格就放弃这次信号
+
+[trade]
+risk_usdt = 3                      # 每笔固定亏 3 USDT：仓位 = 3 ÷ 止损距离，三个币各自独立
+max_notional_usdt = 1200           # 仓位名义价值上限（60 USDT 保证金 × 20 倍）
+stop_atr = 1.5                     # 止损 = 1.5 倍平均小时波动
+target_atr = 3.0                   # 出场 a：目标 = 3 倍
+max_hours = 8                      # 最长持有 8 小时（出场 a、b 都用）
+zone_gap_pct = 0.1                 # 出场 b：目标 = 前方最近的爆仓密集区之前 0.1%
+fade_frac = 0.3                    # 出场 b：被挤一方的小时爆仓量回落到本轮高峰的 30% 以下就离场
+
+[filters]
+# 实时信号记录里打开哪几条。报告里每一条都会分别给出开和关的结果，和这里的开关无关。
+f1 = true                          # 上一小时波动 ≥ 2 倍均值且持仓下降 > 1% → 之后 2 小时不出信号
+f1_vol_mult = 2.0
+f1_oi_drop_pct = 1.0
+f1_block_hours = 2
+f2 = true                          # 北京时间 16:00–21:00 不出信号
+f2_from_hour = 16
+f2_to_hour = 21
+f3 = true                          # 上下两个最近的爆仓密集区离现价都 < 1 倍平均小时波动 → 不出信号
+f3_atr_mult = 1.0
+f4 = true                          # 止损位落在密集区内 → 移到该区外侧 0.1%，按新距离重算仓位
+f4_gap_pct = 0.1
+f5 = true                          # 同一币种被止损后 4 小时内不出反向信号
+f5_hours = 4
+
+[report]
+double_kill_hours = 8              # 出场后 8 小时内价格回到进场价 → 记为「被双杀」
+slippage_window_s = 60             # 滑点 = 止损触发价与之后 1 分钟内最差成交价的差
+bootstrap_reps = 2000
+seed = "flowmon-liq-v1"
