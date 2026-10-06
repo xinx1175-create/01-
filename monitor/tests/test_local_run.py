@@ -1,0 +1,477 @@
+"""在自己的电脑上长期运行要用到的几样：停机占位桶、跨天补日报、睡眠检测、心跳报到、进程锁、异常退出提醒。"""
+import asyncio
+import csv
+import json
+import threading
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import pytest
+
+from conftest import make_cfg
+from flowmon.bucket import BookCapture, Bucket
+from flowmon.heartbeat import ping, redact
+from flowmon.monitor import DOWN_ALL, AlreadyRunning, Monitor
+from flowmon.selfcheck import monitor_running
+from flowmon.sim import FakeOkx, instrument, serve_rest
+from flowmon.storage import save_json
+
+W = 15_000
+DAY = 86_400_000
+T0 = 1_790_725_200_000  # 2026-09-29T23:40:00Z
+
+
+def live_row(s, i=0):
+    """一个完整的桶：成交、持仓量都有，量和持仓量随 i 变化，分数能算出来。"""
+    b = Bucket(s, W)
+    b.add_trade(s + 1000, 60000.0 + (i % 7), 10 + (i % 5) * 3, "buy", 1)
+    b.add_trade(s + 2000, 60000.0 + (i % 5), 8 + (i % 3) * 2, "sell", 1)
+    b.latencies.append(40.0)
+    b.capture = BookCapture(ts=s + W - 100, seq=i, bids=[["59999.9", "5", "0", "1"]], asks=[["60000.1", "5", "0", "1"]],
+                            bid1=59999.9, ask1=60000.1, bid1_sz=5, ask1_sz=5, near_bid=50, near_ask=50,
+                            near_truncated=False)
+    row = b.finish(60000.0, (s + W - 1000, 5000.0 + (i % 11) * 3), 0.0001, 0.01, 30_000, judge=False)
+    return row, b
+
+
+def read_rows(data, sub="buckets"):
+    rows = []
+    for p in sorted((data / sub).glob("*.csv")):
+        with p.open(encoding="utf-8") as f:
+            rows += list(csv.DictReader(f))
+    return rows
+
+
+def misc_records(data):
+    out = []
+    for p in sorted((data / "raw" / "misc").glob("*.jsonl")):
+        out += [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x.strip()]
+    return out
+
+
+def small_cfg(tmp_path, **kw):
+    sections = {"score": {"baseline_hours": 0.1}, "events": {"followup_minutes": 5, "price_horizons_s": [15, 60, 300]},
+                "notify": {"on_start": False}}
+    for k, v in kw.items():
+        sections.setdefault(k, {}).update(v)
+    return make_cfg(tmp_path, **sections)
+
+
+# ---------- 停机占位桶 ----------
+
+def test_restart_fills_downtime_and_writes_missed_reports(tmp_path):
+    cfg = small_cfg(tmp_path)
+    m1 = Monitor(cfg, instrument())
+    m1.restore()
+    for i in range(40):  # 23:40 – 23:50
+        m1._on_bucket(*live_row(T0 + i * W, i))
+    m1.close()
+
+    m2 = Monitor(cfg, instrument())
+    m2.restore()
+    assert m2.last_start == T0 + 39 * W
+    T1 = T0 + 2 * DAY + 3_600_000  # 两天零一小时后重启：2026-10-02T00:40Z
+    m2._on_bucket(*live_row(T1, 0))
+    m2.close()
+
+    rows = read_rows(cfg.data_dir)
+    starts = [int(r["start_ms"]) for r in rows]
+    assert starts == list(range(T0, T1 + W, W)), "停机那段每个桶都要有一行"
+    down = [r for r in rows if r["incomplete_reason"] == "downtime"]
+    assert len(down) == (T1 - (T0 + 40 * W)) // W
+    assert all(r["complete"] == "0" and r["close"] == "" and r["buy_vol"] == "" and r["score_valid"] == "0"
+               for r in down)
+    recs = [m for m in misc_records(cfg.data_dir) if m.get("type") == "bucket" and m["why"] == "downtime"]
+    assert len(recs) == len(down) and not any(m["ok"] for m in recs)
+    # 停机前、停机中、重启当天之前的每一天都补了日报
+    for d in ("2026-09-29", "2026-09-30", "2026-10-01"):
+        assert (cfg.data_dir / "reports" / f"{d}.md").exists(), d
+    rep = (cfg.data_dir / "reports" / "2026-09-30.md").read_text(encoding="utf-8")
+    assert "| 运行时长 | 0.00 小时" in rep and "| 停机 | 24.00 小时" in rep
+
+
+def test_downtime_fill_is_capped_at_restore_days(tmp_path):
+    cfg = small_cfg(tmp_path, storage={"restore_days": 2})
+    m1 = Monitor(cfg, instrument())
+    for i in range(10):
+        m1._on_bucket(*live_row(T0 + i * W, i))
+    m1.close()
+    m2 = Monitor(cfg, instrument())
+    m2.restore()
+    T1 = T0 + 10 * W + 3 * DAY
+    m2._on_bucket(*live_row(T1))
+    m2.close()
+    down = [int(r["start_ms"]) for r in read_rows(cfg.data_dir) if r["incomplete_reason"] == "downtime"]
+    assert len(down) == 2 * DAY // W and down[0] == T1 - 2 * DAY and down[-1] == T1 - W
+
+
+# ---------- 睡眠检测 ----------
+
+def test_clock_jump_is_detected_as_sleep(tmp_path):
+    m = Monitor(small_cfg(tmp_path), instrument())
+    clock = {"wall": T0 / 1000, "mono": 100.0}
+    m._wall = lambda: clock["wall"]
+    m._mono = lambda: clock["mono"]
+    m._check_clock()
+    clock["wall"] += 5
+    clock["mono"] += 5
+    m._check_clock()
+    assert not m.agg.down and m.feed.reconnect_reason is None
+    m.agg._bucket(T0)  # 让聚合器从 T0 开始
+    clock["wall"] += 600  # 系统时钟走了 10 分钟，进程计时只走了 1 秒：睡眠了
+    clock["mono"] += 1
+    m._check_clock()
+    assert "sleep" in m.agg.down and "sleep" in DOWN_ALL
+    assert m.feed.reconnect_reason == "sleep"
+    assert len(m.sleeps) == 1 and m.sleeps[0]["seconds"] == pytest.approx(599)
+    out = m.agg.advance(T0 + 40 * W, m.book)
+    assert len(out) == 39 and all("sleep" in row["incomplete_reason"] for row, _ in out)
+    # 重连拿到新快照后恢复（快照时刻所在的桶仍算不完整，之后的桶恢复）
+    m.agg.clear_down(DOWN_ALL, T0 + 40 * W)
+    later = [row for row, _ in m.agg.advance(T0 + 60 * W, m.book) if row["start_ms"] > T0 + 40 * W]
+    assert later and all("sleep" not in row["incomplete_reason"] for row in later)
+
+
+def test_sleep_forces_reconnect_and_recovers(tmp_path):
+    """实时链路：模拟醒来后，强制重连、拿到新快照，之后的桶恢复完整。"""
+    async def main():
+        rest = serve_rest("127.0.0.1", 0)
+        stop, ready = asyncio.Event(), asyncio.Event()
+        fake = FakeOkx(speed=60, seed=5)
+        srv = asyncio.create_task(fake.serve("127.0.0.1", 0, stop, ready))
+        await ready.wait()
+        cfg = small_cfg(tmp_path, exchange={"ws_public_url": f"ws://127.0.0.1:{fake.port}/ws/v5/public",
+                                            "rest_base_url": f"http://127.0.0.1:{rest.server_address[1]}"})
+        m = Monitor(cfg, instrument())
+        m.restore()
+
+        async def doze():
+            await asyncio.sleep(3)
+            now = time.time()
+            m._on_sleep(now - 1, now, 30.0)
+
+        t = asyncio.create_task(doze())
+        await m.run(duration_s=7)
+        await t
+        stop.set()
+        await srv
+        rest.shutdown()
+        return cfg
+
+    cfg = asyncio.run(main())
+    closes = [x for x in misc_records(cfg.data_dir) if x.get("type") == "conn" and x.get("event") == "close"]
+    assert any(x.get("reason") == "sleep" for x in closes)
+    rows = read_rows(cfg.data_dir)
+    i = next(k for k, r in enumerate(rows) if "sleep" in r["incomplete_reason"])
+    assert any(r["complete"] == "1" for r in rows[i + 1:]), "重连后桶要恢复完整"
+
+
+# ---------- 心跳 ----------
+
+class _Hits(BaseHTTPRequestHandler):
+    hits: list[str] = []
+
+    def do_GET(self):
+        _Hits.hits.append(self.path)
+        code = 200 if self.path.startswith("/ok") else 500
+        self.send_response(code)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, *a):
+        pass
+
+
+@pytest.fixture
+def hb_server():
+    _Hits.hits = []
+    srv = ThreadingHTTPServer(("127.0.0.1", 0), _Hits)
+    th = threading.Thread(target=srv.serve_forever, daemon=True)
+    th.start()
+    yield f"http://127.0.0.1:{srv.server_address[1]}"
+    srv.shutdown()
+
+
+def test_ping_reports_errors(hb_server):
+    assert ping(hb_server + "/ok", 2) is None
+    assert ping(hb_server + "/bad", 2) == "HTTP 500"
+    assert ping("http://127.0.0.1:9/x", 1) is not None
+    assert redact("https://hc-ping.com/1234-secret") == "https://hc-ping.com/…"
+
+
+def test_heartbeat_only_while_data_flows(tmp_path, hb_server):
+    cfg = small_cfg(tmp_path, heartbeat={"url": hb_server + "/ok", "interval_s": 0.2, "timeout_s": 0.1,
+                                         "max_data_age_s": 30})
+    m = Monitor(cfg, instrument())
+
+    async def main():
+        m.last_complete_wall = time.time()
+        t = asyncio.create_task(m._heartbeat())
+        await asyncio.sleep(1.1)
+        n_fresh = len(_Hits.hits)
+        m.last_complete_wall = time.time() - 100  # 行情断了 100 秒
+        await asyncio.sleep(0.3)
+        n_mark = len(_Hits.hits)
+        await asyncio.sleep(0.8)
+        m.stop.set()
+        await t
+        return n_fresh, n_mark
+
+    n_fresh, n_mark = asyncio.run(main())
+    assert n_fresh >= 3
+    assert len(_Hits.hits) == n_mark, "行情断了就不再报到"
+    assert m.hb["paused_since_ms"] is not None and m.hb["last_ok_ms"] is not None
+    health = json.loads((cfg.data_dir / "state" / "health.json").read_text(encoding="utf-8"))
+    assert health["heartbeat"]["configured"] and health["heartbeat"]["last_ok_utc"]
+    assert health["heartbeat"]["paused_since_utc"]
+
+
+def test_heartbeat_failures_are_counted(tmp_path, hb_server):
+    cfg = small_cfg(tmp_path, heartbeat={"url": hb_server + "/bad", "interval_s": 0.2, "timeout_s": 0.1,
+                                         "max_data_age_s": 30})
+    m = Monitor(cfg, instrument())
+
+    async def main():
+        m.last_complete_wall = time.time()
+        t = asyncio.create_task(m._heartbeat())
+        await asyncio.sleep(0.7)
+        m.stop.set()
+        await t
+
+    asyncio.run(main())
+    assert m.hb["fail_streak"] >= 2 and m.hb["last_err"] == "HTTP 500" and m.hb["last_ok_ms"] is None
+
+
+# ---------- 进程锁、异常退出提醒 ----------
+
+def test_lock_prevents_second_monitor(tmp_path):
+    cfg = small_cfg(tmp_path)
+    m1, m2 = Monitor(cfg, instrument()), Monitor(cfg, instrument())
+    assert not monitor_running(cfg)
+    m1.lock()
+    assert monitor_running(cfg)
+    with pytest.raises(AlreadyRunning):
+        m2.lock()
+    m1.unlock()
+    assert not monitor_running(cfg)
+    m2.lock()
+    m2.unlock()
+
+
+def _run_briefly(cfg, sent):
+    m = Monitor(cfg, instrument())
+    marker = cfg.data_dir / "state" / "running.json"
+    # 记下推送时运行标记还在不在：「已停止」推送之前就要删掉，免得网络慢被强杀后误报「没有正常停止」
+    m.notifier.send = lambda title, body, key=None: sent.append((title, marker.exists())) or True
+    m.restore()
+    asyncio.run(m.run(duration_s=1))
+    return m
+
+
+def test_unclean_previous_exit_is_reported(tmp_path):
+    # 连不上交易所也没关系，这里只看启动和停止
+    cfg = small_cfg(tmp_path, exchange={"ws_public_url": "ws://127.0.0.1:9/ws"}, notify={"on_start": True},
+                    connection={"reconnect_backoff_min_s": 0.2})
+    marker = cfg.data_dir / "state" / "running.json"
+    save_json(marker, {"pid": 1, "started_utc": "2026-10-01T00:00:00.000Z"})
+    sent = []
+    _run_briefly(cfg, sent)
+    assert sent[0][0].startswith("已重新启动（上次没有正常停止）")
+    assert ("已停止", False) in sent
+    assert not marker.exists(), "正常停止后删掉运行标记"
+    sent2 = []
+    _run_briefly(cfg, sent2)
+    assert sent2[0][0] == "已启动"
+
+
+def test_corrupt_marker_still_counts_as_unclean(tmp_path):
+    """断电时运行标记可能只写了一半：照样启动，照样当作上次没正常停止。"""
+    cfg = small_cfg(tmp_path, exchange={"ws_public_url": "ws://127.0.0.1:9/ws"},
+                    connection={"reconnect_backoff_min_s": 0.2})
+    marker = cfg.data_dir / "state" / "running.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text('{"pid": 12', encoding="utf-8")
+    (cfg.data_dir / "state" / "events.json").write_text("", encoding="utf-8")
+    sent = []
+    _run_briefly(cfg, sent)
+    assert sent[0][0].startswith("已重新启动（上次没有正常停止）")
+
+
+# ---------- 半行（崩溃、断电时没写完） ----------
+
+def test_torn_bucket_row_does_not_block_restart(tmp_path):
+    cfg = small_cfg(tmp_path)
+    m1 = Monitor(cfg, instrument())
+    for i in range(10):
+        m1._on_bucket(*live_row(T0 + i * W, i))
+    m1.close()
+    p = cfg.data_dir / "buckets" / "2026-09-29.csv"
+    good = p.read_bytes()
+    # 断电：最后一行只写了一半
+    row, _ = live_row(T0 + 10 * W, 10)
+    p.write_bytes(good + f"{row['time_utc']},{row['start_ms']},15,600".encode())
+    for _ in range(3):  # 重启几次都要能起来，并且接上
+        m = Monitor(cfg, instrument())
+        m.restore()
+        assert m.last_start is not None
+        nxt = m.last_start + W
+        m._on_bucket(*live_row(nxt, 0))
+        m.close()
+    rows = read_rows(cfg.data_dir)
+    starts = [int(r["start_ms"]) for r in rows if r["start_ms"].isdigit() and len(r) == len(rows[0])]
+    assert starts[:10] == [T0 + i * W for i in range(10)]
+    # 半行之后的新行没有接在半行后面
+    from flowmon.storage import read_csv
+    from flowmon.schema import bucket_columns
+    parsed = list(read_csv([p], dict(bucket_columns(cfg))))
+    assert [r["start_ms"] for r in parsed] == [T0 + i * W for i in range(13)]  # 半行那个桶重启时补成了占位桶
+
+
+# ---------- 推送 ----------
+
+def test_notifier_failure_does_not_use_up_rate_limit(tmp_path, hb_server):
+    from flowmon.notify import Notifier
+    cfg = small_cfg(tmp_path, notify={"kind": "bark", "url": hb_server + "/bad", "min_interval_s": 3600})
+    n = Notifier(cfg.notify, "[t]")
+    assert n.send("磁盘", "x", "disk") is False
+    n.cfg = small_cfg(tmp_path, notify={"kind": "bark", "url": hb_server + "/ok", "min_interval_s": 3600}).notify
+    assert n.send("磁盘", "x", "disk") is True     # 上次失败不算数
+    assert n.send("磁盘", "x", "disk") is None     # 成功之后才限频
+    assert Notifier(small_cfg(tmp_path).notify, "[t]").send("a", "b") is None  # 没启用
+
+
+def test_notify_retries_until_network_is_back(tmp_path):
+    m = Monitor(small_cfg(tmp_path), instrument())
+    m.notify_retry_s = (0, 0.05, 0.05, 0.05)
+    results = iter([False, False, True])
+    calls = []
+    m.notifier.send = lambda title, body, key=None: calls.append(title) or next(results)
+
+    async def main():
+        m._notify("电脑睡眠过", "x", "sleep")
+        await asyncio.sleep(0.5)
+
+    asyncio.run(main())
+    assert calls == ["电脑睡眠过"] * 3
+
+
+# ---------- 睡眠醒来后补封：不带旧价格、旧盘口，分批处理 ----------
+
+def _awake_monitor(tmp_path, n=40):
+    """盘口就绪、有成交地跑 n 个桶，返回 (monitor, 时钟)。时钟可以拨，用来模拟睡眠。"""
+    import flowmon.okx as okx
+    cfg = small_cfg(tmp_path)
+    m = Monitor(cfg, instrument())
+    m.book.apply_snapshot([["59999.9", "5", "0", "1"]], [["60000.1", "5", "0", "1"]], T0, 1, None)
+    for i in range(n):
+        s = T0 + i * W
+        m.agg.on_trade(s + 100, 60000.0 + i, 10, "buy", 1, s + 150)
+        m.agg.on_oi(s + 200, 5000.0 + i)
+        for row, b in m.agg.advance(s + W + 600, m.book):
+            m._on_bucket(row, b)
+    clock = {"w": (T0 + n * W) / 1000, "m": 100.0}
+    m._wall = lambda: clock["w"]
+    m._mono = lambda: clock["m"]
+
+    def sleep_for(hours):
+        m._check_clock()
+        clock["w"] += hours * 3600
+        clock["m"] += 1
+        m._check_clock()
+        m.max_ts = int(clock["w"] * 1000)
+        m.offset_ms = okx.now_ms() - m.max_ts  # 本地时钟估计的交易所时间 = 醒来那一刻
+
+    return m, sleep_for
+
+
+def test_sleep_catch_up_has_no_stale_price_or_book(tmp_path, caplog):
+    m, sleep_for = _awake_monitor(tmp_path)
+    # 睡前刚出了一个信号：它之后的价格都落在睡眠里
+    ev = m.events._new("control", 1, None, m.last_row, __import__("flowmon.score", fromlist=["x"]).ScoreResult(S=0.0),
+                       {"no_trade": False, "no_trade_reason": ""}, None, T0 + 40 * W)
+    m.events.pending.append(ev)
+    sleep_for(72)
+    calls = []
+    orig = m.agg.advance
+    m.agg.advance = lambda wm, book, limit=None: calls.append(limit) or orig(wm, book, limit)
+    with caplog.at_level("INFO"):
+        asyncio.run(m._close_buckets())
+    m.close()
+    rows = read_rows(m.cfg.data_dir)
+    sl = [r for r in rows if int(r["start_ms"]) >= T0 + 41 * W]
+    assert 72 * 240 - 3 <= len(sl) <= 72 * 240  # 最后一两个桶还在宽限期里，没封
+    assert all("sleep" in r["incomplete_reason"] and r["close"] == "" and r["bid1"] == "" for r in sl)
+    # 睡眠期间没有再存盘口快照
+    books = sum(1 for p in (m.cfg.data_dir / "raw" / "books").glob("*") for _ in p.open())
+    assert books == 40
+    # 分批封、每批有上限；不逐个桶写日志，只写一行汇总
+    assert set(calls) == {200} and len(calls) > 80
+    msgs = [r.getMessage() for r in caplog.records]
+    assert sum(1 for x in msgs if x.startswith("桶 ")) == 0
+    summary = [x for x in msgs if x.startswith("补封积压的桶 ")]
+    assert len(summary) == 1 and f"补封积压的桶 {len(sl) + 1} 个" in summary[0]  # 加上睡着那一刻所在的桶
+    assert "sleep" in summary[0]
+    # 跟踪中的事件：睡眠里的「之后 N 分钟价格」是未知的，判定时自然被排除
+    from flowmon.evaluate import same_dir_return
+    events = read_rows(m.cfg.data_dir, "events")
+    e = next(x for x in events if x["event_id"] == ev["event_id"])
+    assert e["px_15s"] == e["px_60s"] == e["px_300s"] == "" and e["followup_complete"] == "0"
+    assert same_dir_return({**ev, "px_300s": None}, 300) is None
+
+
+def test_restart_fill_runs_in_batches_without_double_fill(tmp_path):
+    cfg = small_cfg(tmp_path)
+    m1 = Monitor(cfg, instrument())
+    for i in range(40):
+        m1._on_bucket(*live_row(T0 + i * W, i))
+    m1.close()
+    m2 = Monitor(cfg, instrument())
+    m2.restore()
+    t1 = T0 + 40 * W + 2 * DAY
+    m2.agg._bucket(t1)  # 重启后第一个新桶从 t1 开始
+    m2.agg.on_trade(t1 + 100, 60000.0, 1, "buy", 1, t1 + 120)
+    m2.max_ts = t1 + W + 600
+    import flowmon.okx as okx
+    m2.offset_ms = okx.now_ms() - m2.max_ts
+    yields = []
+    real_sleep = asyncio.sleep
+
+    async def counting_sleep(x, *a):
+        yields.append(x)
+        return await real_sleep(x, *a)
+
+    async def main():
+        asyncio.sleep = counting_sleep
+        try:
+            await m2._close_buckets()
+        finally:
+            asyncio.sleep = real_sleep
+        await real_sleep(0.3)  # 等后台线程写完日报
+
+    asyncio.run(main())
+    m2.close()
+    rows = read_rows(cfg.data_dir)
+    starts = [int(r["start_ms"]) for r in rows]
+    assert starts == list(range(T0, t1 + W, W)), "占位桶不重复、不漏"
+    assert sum(r["incomplete_reason"] == "downtime" for r in rows) == 2 * DAY // W
+    assert yields.count(0) >= (2 * DAY // W) // 500, "补占位桶时分批让出事件循环"
+    # 跨过的日子在后台线程里补了日报（重启在 10-01 23:50，10-01 当天还没结束）
+    assert not (cfg.data_dir / "reports" / "2026-10-01.md").exists()
+    for d in ("2026-09-29", "2026-09-30"):
+        assert (cfg.data_dir / "reports" / f"{d}.md").exists(), d
+
+
+def test_restart_without_network_does_not_reuse_old_price(tmp_path):
+    """重启后网络还没好：启动中、断线的桶没有成交，价格留空，不沿用停机前的收盘。"""
+    cfg = small_cfg(tmp_path)
+    m1 = Monitor(cfg, instrument())
+    for i in range(10):
+        m1._on_bucket(*live_row(T0 + i * W, i))
+    m1.close()
+    m2 = Monitor(cfg, instrument())
+    m2.restore()
+    assert m2.agg.prev_close is not None
+    m2.agg.set_down("startup", T0 + 20 * W)
+    m2.agg._bucket(T0 + 20 * W)
+    rows = [r for r, _ in m2.agg.advance(T0 + 25 * W + 600, m2.book)]
+    assert rows and all(r["close"] is None and "startup" in r["incomplete_reason"] for r in rows)

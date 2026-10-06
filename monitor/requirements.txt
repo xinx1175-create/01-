@@ -1,0 +1,2 @@
+websockets>=15,<18
+python-socks[asyncio]>=2.4

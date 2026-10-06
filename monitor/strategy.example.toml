@@ -1,0 +1,31 @@
+# 资金流带和阶段二回测的参数。
+#
+# 单独一个文件，正在运行的监控器不读它（监控器只读 config.toml），改这里不影响录数据。
+#   python -m flowmon backtest --config config.toml --strategy strategy.toml
+# 规则和 config.toml 一样：每一项都必须写，少写、多写都会报错。
+
+[band]                                    # 资金流带：量买卖资金本身的「布林带」
+window_buckets = 4                        # 读数 = 最近 4 个桶（1 分钟）的净主动成交（主动买 − 主动卖）
+inner = 1.0                               # 内带 ±1σ（σ = 正常时读数的均方根，基准同力量分数：最近 24 小时的有效数据）
+outer = 2.0                               # 外带 ±2σ
+noise_window_minutes = 30                 # 价格噪声：最近 30 分钟每 15 秒收益的均方根
+noise_horizon_minutes = 5                 # 折算成 5 分钟的噪声（止损要扛住的时间尺度）
+noise_min_coverage = 0.5                  # 噪声窗口里至少一半的收益有效才算
+
+[band_position]                           # 资金流带仓位法（阶段二候选，和规格第 7 节并排回测）
+stop_noise_mult = 2.0                     # 止损距离 = 2 × 5 分钟价格噪声
+min_stop_pct = 0.15                       # 止损距离下限（%），免得太窄被手续费和价差吃掉
+add_needs_profit = true                   # 只在有浮盈时加仓，不往亏的仓位上加
+fade_buckets = 2                          # 读数连续 2 个桶回到内带以内 → 减一档
+exit_fade_buckets = 3                     # 一档时，读数连续 3 个桶在内带以内 → 平仓（资金停了）
+reverse_exit = true                       # 读数到反向内带之外（资金掉头）→ 立刻平仓
+
+[backtest]
+maker_wait_buckets = 1                    # 进场挂单最多等几个桶（1 = 15 秒），没成交就放弃
+train_fraction = 0.6                      # 前 60% 的时间是训练段（只在这里挑参数），后 40% 是测试段
+null_runs = 50                            # 打乱时间对照：信号整体错开随机时间重跑多少次
+null_min_shift_hours = 24                 # 至少错开多久
+seed = "flowmon-backtest-v1"              # 随机种子：同一份数据结果不变
+grid_outer = [1.5, 2.0, 2.5]              # 资金流带参数网格：外带倍数
+grid_stop_noise_mult = [1.5, 2.0, 3.0]    #   止损倍数
+grid_exit_fade_buckets = [2, 3, 5]        #   平仓确认桶数
