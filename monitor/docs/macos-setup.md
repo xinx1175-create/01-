@@ -281,6 +281,28 @@ flowmon report --date 2026-10-06
 open ~/flowmon/data
 ```
 
+## 13. 回测：比较两套仓位管理（录满 2 天以后）
+
+先复制一份回测参数（只需一次）：
+
+```bash
+cp -n ~/flowmon/src/monitor/strategy.example.toml ~/flowmon/strategy.toml
+```
+
+然后：
+
+```bash
+flowmon backtest --write
+```
+
+大约一两分钟，结果写到 `~/flowmon/data/reports/backtest.md`，打开看：
+
+```bash
+open ~/flowmon/data/reports/backtest.md
+```
+
+数据不到两周、测试段不到 100 笔交易时，结果主要是噪声，看看就好。怎么读这份报告见 `~/flowmon/src/monitor/docs/strategy-review.md` 第六节。
+
 ## 日常操作
 
 | 要做什么 | 命令 |
@@ -294,6 +316,7 @@ open ~/flowmon/data
 | 彻底卸掉后台服务 | `flowmon service uninstall` |
 | 更新代码 | `cd ~/flowmon/src && git pull && ~/flowmon/venv/bin/pip install -r monitor/requirements.txt && flowmon service restart` |
 | 满 2 周、300 条后做阶段一判定 | `flowmon evaluate --write` |
+| 回测两套仓位管理 | `flowmon backtest --write` |
 
 故意停机（比如带电脑出门）前，先在 Healthchecks.io 上点这个检查的 **Pause**，免得一直收到报警；回来后它收到第一次报到会自动恢复。
 

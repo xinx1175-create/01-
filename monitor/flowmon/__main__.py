@@ -106,6 +106,28 @@ def cmd_evaluate(a) -> int:
     return 0 if verdict else 1
 
 
+def cmd_backtest(a) -> int:
+    from .backtest import load_rows, load_strategy, report
+    from .replay import days_between
+
+    cfg = config_mod.load(a.config)
+    # 默认用配置文件旁边的 strategy.toml
+    st = load_strategy(a.strategy or Path(a.config).resolve().parent / "strategy.toml")
+    src = Path(a.src).resolve() if a.src else cfg.data_dir
+    days = days_between(a.frm, a.to or a.frm) if a.frm else None
+    rows = load_rows(cfg, src, days)
+    if not rows:
+        print("没有桶数据")
+        return 1
+    text = report(cfg, st, rows, with_null=not a.quick, with_fit=not a.quick)
+    if a.write:
+        p = src / "reports" / "backtest.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(text, encoding="utf-8")
+    print(text)
+    return 0
+
+
 def cmd_status(a) -> int:
     from .schema import bucket_columns
     from .storage import day_files, load_json, read_csv
@@ -247,6 +269,16 @@ def main(argv=None) -> int:
     r.add_argument("--src", default=None, help="数据目录，默认配置里的 data_dir")
     r.add_argument("--write", action="store_true", help="同时写到 data/reports/evaluation.md")
     r.set_defaults(fn=cmd_evaluate)
+
+    r = sub.add_parser("backtest", help="阶段二回测：规格第 7 节和资金流带两套仓位管理")
+    r.add_argument("--config", required=True)
+    r.add_argument("--strategy", default=None, help="资金流带和回测参数，默认配置文件旁边的 strategy.toml")
+    r.add_argument("--from", dest="frm", default=None, help="起始日期，默认全部数据")
+    r.add_argument("--to", default=None)
+    r.add_argument("--src", default=None, help="数据目录，默认配置里的 data_dir")
+    r.add_argument("--quick", action="store_true", help="跳过打乱时间对照和参数网格（快）")
+    r.add_argument("--write", action="store_true", help="同时写到 data/reports/backtest.md")
+    r.set_defaults(fn=cmd_backtest)
 
     r = sub.add_parser("status", help="看最近的桶和事件")
     r.add_argument("--config", required=True)
